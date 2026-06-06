@@ -1,0 +1,12 @@
+{
+  "name": "vite-plugin-codetracer-wasm",
+  "version": "0.1.0",
+  "description": "Vite plugin: routes WASM imports through codetracer-wasm-instrumenter (M27).",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node --test index.test.js"
+  },
+  "keywords": ["codetracer", "wasm", "instrumentation", "vite"],
+  "license": "Apache-2.0 OR MIT"
+}

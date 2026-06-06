@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/codetracer-wasm-instrumenter",
+    "crates/codetracer-wasm-stub-host",
+    "crates/codetracer-wasm-host-module-framework",
+    "crates/ct-instrument-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/metacraft-labs/codetracer-wasm-instrumenter"
+authors = ["CodeTracer contributors"]
+
+[workspace.dependencies]
+walrus       = "0.26"
+wasmparser   = "0.245"
+wasmprinter  = "0.245"
+wat          = "1.245"
+anyhow       = "1"
+thiserror    = "1"
+clap         = { version = "4", features = ["derive"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+toml         = "0.8"

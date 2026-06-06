@@ -1,0 +1,21 @@
+[package]
+name        = "ct-instrument-cli"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+authors.workspace     = true
+description = "`ct instrument` — CLI front-end for codetracer-wasm-instrumenter."
+
+[[bin]]
+name = "ct-instrument"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap   = { workspace = true }
+codetracer-wasm-instrumenter = { path = "../codetracer-wasm-instrumenter" }
+
+[dev-dependencies]
+wat        = { workspace = true }
+wasmparser = { workspace = true }
