@@ -226,6 +226,152 @@ fn test_stylus_fixture_regenerator_uses_ct_instrument() {
     );
 }
 
+/// One `(name, params, results)` triple parsed out of the legacy Go
+/// source — the structural moral equivalent of a `PassThroughFunction`.
+type LegacyExport = (String, Vec<WasmType>, Vec<WasmType>);
+
+/// Parse the 34 `exportFunc(mb, trace, "<name>", []api.ValueType{...},
+/// []api.ValueType{...}, ...)` calls in the legacy
+/// `stylus_funcs.go` and return them as `LegacyExport` triples.
+/// Returns `None` when the sibling repo isn't vendored.
+///
+/// This is the "live legacy source" half of the M28 parity contract:
+/// the hand-coded `legacy_stylus_surface()` fixture above is what we
+/// build the M27 plan against; this parser is what guarantees that
+/// fixture itself stays in sync with the Go file it claims to mirror.
+/// Together they pin the *signature surface* end-to-end without
+/// needing a Stylus runner (cargo-stylus + nitro-devnode) — those
+/// stay deferred to `value-origin-ci-scripts/run-m28-stylus-runner.sh`
+/// for live runtime parity.
+fn parse_legacy_go_surface() -> Option<Vec<LegacyExport>> {
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let legacy = here.join("../../../codetracer-wasm-recorder/internal/stylus/stylus_funcs.go");
+    let src = std::fs::read_to_string(&legacy).ok()?;
+
+    // The line `\treturn exportFunc(mb, trace, "<name>",` starts each
+    // export; the next non-blank line is `\t\t[]api.ValueType{...},
+    // []api.ValueType{...},`. We scan paired lines without a real
+    // Go parser — the surface is wide enough that a structured parser
+    // would be overkill, and the pattern has been stable since the
+    // file's introduction.
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for i in 0..lines.len() {
+        let line = lines[i].trim();
+        let prefix = "return exportFunc(mb, trace, \"";
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let end = rest.find('"')?;
+            let name = rest[..end].to_string();
+            // The signature line is the *next* line; pull it.
+            let sig = lines.get(i + 1)?.trim();
+            let (params, results) = parse_go_signature_line(sig)?;
+            out.push((name, params, results));
+        }
+    }
+    Some(out)
+}
+
+fn parse_go_signature_line(sig: &str) -> Option<(Vec<WasmType>, Vec<WasmType>)> {
+    // Expected form: `[]api.ValueType{...}, []api.ValueType{...},`
+    let mut groups = Vec::new();
+    let mut cursor = sig;
+    while let Some(open) = cursor.find("[]api.ValueType{") {
+        let after = &cursor[open + "[]api.ValueType{".len()..];
+        let close = after.find('}')?;
+        groups.push(parse_value_type_list(&after[..close]));
+        cursor = &after[close + 1..];
+    }
+    if groups.len() != 2 {
+        return None;
+    }
+    let params: Option<Vec<WasmType>> = groups.remove(0).into_iter().collect();
+    let results: Option<Vec<WasmType>> = groups.remove(0).into_iter().collect();
+    Some((params?, results?))
+}
+
+fn parse_value_type_list(s: &str) -> Vec<Option<WasmType>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| match t {
+            "api.ValueTypeI32" => Some(WasmType::I32),
+            "api.ValueTypeI64" => Some(WasmType::I64),
+            "api.ValueTypeF32" => Some(WasmType::F32),
+            "api.ValueTypeF64" => Some(WasmType::F64),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_legacy_go_source_parity_against_m27_plan() {
+    // Hardens the M28 D3 deliverable: the *hand-extracted* legacy
+    // surface in `legacy_stylus_surface()` above is now machine-checked
+    // against the live Go source under the sibling
+    // `codetracer-wasm-recorder/` repo. SKIPs cleanly when the sibling
+    // isn't vendored (this crate doesn't take a hard dep on the recorder
+    // checkout). Together with `test_stylus_recorder_via_wasm_instrumentation_matches_legacy`
+    // this means the M27 TOML, the hand-extracted fixture, and the
+    // production Go source are pinned to the same 34-entry surface.
+    let parsed = match parse_legacy_go_surface() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "SKIPPED: legacy codetracer-wasm-recorder/internal/stylus/stylus_funcs.go \
+                 not visible from this workspace. Vendor the wasm-recorder repo as a \
+                 sibling checkout to exercise this parity check."
+            );
+            return;
+        }
+    };
+
+    let plan = load_stylus_plan();
+    assert_eq!(
+        parsed.len(),
+        plan.functions.len(),
+        "legacy Go declares {} exports; M27 plan declares {} — surfaces have drifted",
+        parsed.len(),
+        plan.functions.len(),
+    );
+
+    for (name, params, results) in &parsed {
+        let entry = plan
+            .functions
+            .iter()
+            .find(|f| f.name == *name)
+            .unwrap_or_else(|| panic!("legacy Go exports `{name}` but the M27 plan does not"));
+        assert_eq!(
+            entry.params.as_slice(),
+            params.as_slice(),
+            "param drift on vm_hooks.{name} (legacy Go vs M27 plan)",
+        );
+        assert_eq!(
+            entry.results.as_slice(),
+            results.as_slice(),
+            "result drift on vm_hooks.{name} (legacy Go vs M27 plan)",
+        );
+    }
+
+    // Also confirm the EvmEvent default in codetracer.toml matches
+    // the legacy Go RegisterRecordEvent kind. The legacy file records
+    // exactly 34 `EventKindEvmEvent` calls (one per export); the TOML
+    // pins `default = "EvmEvent"`. Drift here would break byte-for-byte
+    // event-stream parity with the existing stylus-fund-trace fixture.
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let legacy_text = std::fs::read_to_string(
+        here.join("../../../codetracer-wasm-recorder/internal/stylus/stylus_funcs.go"),
+    )
+    .expect("checked above");
+    let evm_count = legacy_text.matches("EventKindEvmEvent").count();
+    assert_eq!(
+        evm_count,
+        parsed.len(),
+        "legacy Go records EventKindEvmEvent {evm_count} times but exports {} hooks; \
+         TOML's [event_kinds].default = \"EvmEvent\" presumes 1:1",
+        parsed.len(),
+    );
+}
+
 #[test]
 fn test_origin_stylus_evm_canonical_chain_via_m27() {
     // M23's canonical fixture lives at
