@@ -434,16 +434,27 @@ pub fn _module_for_test(_m: &Module) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codetracer_wasm_instrumenter::Pipeline;
+    use codetracer_wasm_instrumenter::{Pipeline, PipelineConfig};
 
-    fn pair(wat: &str) -> (Vec<Event>, Vec<Event>) {
+    fn pair_with(wat: &str, config: PipelineConfig) -> (Vec<Event>, Vec<Event>) {
         let original = wat::parse_str(wat).unwrap();
-        let instrumented = Pipeline::new().run_bytes(&original).unwrap();
+        let instrumented = Pipeline::with_config(config).run_bytes(&original).unwrap();
         let oracle = record_interpreter(&original).unwrap();
         let observed = record_instrumented(&instrumented).unwrap();
         (oracle, observed)
     }
 
+    fn pair(wat: &str) -> (Vec<Event>, Vec<Event>) {
+        pair_with(wat, PipelineConfig::default())
+    }
+
+    /// `record_interpreter` is the interior-model oracle: it reports a
+    /// `Write` for every store in the *original* module. Comparing it
+    /// against a boundary-only rewrite is therefore not a parity check
+    /// but a category error — the two are answering different
+    /// questions. So this test asks for the interior model explicitly,
+    /// which is also the only configuration in which its subject (the
+    /// store pass) runs at all after M36.
     #[test]
     fn parity_for_pure_store_module() {
         let wat = r#"
@@ -454,7 +465,13 @@ mod tests {
                 local.get 1
                 i32.store))
         "#;
-        let (oracle, observed) = pair(wat);
+        let (oracle, observed) = pair_with(
+            wat,
+            PipelineConfig {
+                instrument_stores: true,
+                ..PipelineConfig::default()
+            },
+        );
         assert_parity(&oracle, &observed).unwrap();
     }
 

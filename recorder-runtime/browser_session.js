@@ -67,10 +67,21 @@ export const JS_WASM_REALM_BOUNDARY = "js-wasm-realm";
 export const FUNC_KIND_IMPORT = 0;
 export const FUNC_KIND_EXPORT = 1;
 /**
- * Group header of the experimental interior store pass. Not a realm
- * crossing: `fn_index` carries the store's byte width and the value
- * tuple is `(addr, old, new)`. Retired together with the store pass in
- * M36.
+ * Group header of the withdrawn interior store pass.
+ *
+ * Retired in M36: `PipelineConfig::instrument_stores` is off by
+ * default and this runtime records nothing for such a group. The
+ * constant survives because the pass is still reachable behind the
+ * flag, so a module instrumented for that experiment can still call
+ * these hooks — and a group this runtime did not recognise would be
+ * mis-framed as a boundary tuple, putting invented `import #4:arg0`
+ * bindings into the recording. Recognising it is what lets it be
+ * *ignored*.
+ *
+ * Spec §§ 2 and 11 explain why the interior model is withdrawn: it
+ * cannot be complete (locals and operand-stack values have no
+ * address), and it was measured at +2955 % runtime against +11 % for
+ * boundary capture.
  */
 export const FUNC_KIND_STORE = 2;
 
@@ -127,42 +138,24 @@ export function resolveWasmManifest(explicit) {
 }
 
 /**
- * Read a module's published memory layout, if it exports one.
+ * Name of the binding a boundary value is recorded under.
  *
- * WASM stores address raw offsets, so a recorded write reads as
- * `mem[1048576] = 620` unless something maps that address back to a
- * name. Nothing in the binary carries that mapping for a release
- * build, so it has to come from the module itself: a module that wants
- * its memory writes to be legible exports a base address, a slot count,
- * and the slot names.
+ * The tuple element's position is part of the name because that is
+ * all the recording can honestly say about it: WebAssembly boundary
+ * signatures are positional and carry no parameter names, so
+ * `compute_balance:arg1` is a fact while `compute_balance:amount`
+ * would be a guess. A consumer that wants source-level names gets
+ * them from the materialised trace the replayer produces (spec § 6),
+ * which has DWARF in hand.
  *
- * This reads that convention when present and returns `null` otherwise
- * — a module without it still records every write, just against
- * addresses. Nothing is guessed.
- *
- * @param {Record<string, any>} exports Instantiated module exports.
- * @param {string[]} [slotNames] Names for the slots, in order.
- * @returns {{name: string, start: number, size: number}[] | null}
+ * @param {string} label Function label — an export name, or
+ *   `import #<n>` for the import edge.
+ * @param {"arg"|"ret"} role Which side of the crossing.
+ * @param {number} slot Positional index within the tuple.
+ * @returns {string}
  */
-export function describeMemoryLayout(exports, slotNames) {
-  if (
-    typeof exports?.ledger_base !== "function" ||
-    typeof exports?.ledger_len !== "function"
-  ) {
-    return null;
-  }
-  const base = exports.ledger_base() >>> 0;
-  const count = exports.ledger_len() >>> 0;
-  const slotSize = 4;
-  const layout = [];
-  for (let i = 0; i < count; i++) {
-    layout.push({
-      name: slotNames?.[i] ?? `slot${i}`,
-      start: base + i * slotSize,
-      size: slotSize,
-    });
-  }
-  return layout;
+export function boundaryBindingName(label, role, slot) {
+  return `${label}:${role}${slot}`;
 }
 
 /**
@@ -176,21 +169,24 @@ export function describeMemoryLayout(exports, slotNames) {
  *   mirrored JS-side markers. Defaults to `globalThis.__ct`.
  * @property {(url: string) => any} [transportFactory] Test seam.
  * @property {number} [flushThreshold] Events buffered before a flush.
- * @property {Record<string, string>} [returnValueNames] Per-export map
- *   from function name to the binding holding the value that function
- *   hands back across the realm boundary.
+ * @property {Record<string, string>} [returnValueNames] Per-export
+ *   override of the binding an origin chain resumes on when it crosses
+ *   *into* this recording.
  *
- *   An origin chain crossing *into* this recording resumes its walk on
- *   that name, so supplying it is what lets the chain continue into the
- *   module's own computation rather than stopping at its edge. It is
- *   the WASM-side counterpart of the `showText` argument to
- *   `__ct.markCorrelation` on the JavaScript side: in both cases the
- *   program declares which of its bindings crosses, because nothing
- *   else can know.
+ *   Rarely needed. The default is the export's own result binding —
+ *   `<export>:ret0`, the name this runtime records the crossing value
+ *   under — which is the right answer whenever the value that crossed
+ *   is the value the function returned. That is the WebAssembly
+ *   boundary contract, so the module needs no annotation at all: it is
+ *   the difference between this and `__ct.markCorrelation` on the
+ *   JavaScript side, where a program can hand any of its bindings
+ *   across and so has to name one.
  *
- *   Keyed per function rather than set once for the module: exports
- *   return different things, and naming the wrong binding would send a
- *   chain crossing at one function looking for another's value.
+ *   An override is for the case where the return value is not the
+ *   interesting one — a function returning a status code that writes
+ *   its real output somewhere else, say. Keyed per export, because
+ *   exports return different things and naming the wrong binding sends
+ *   a chain crossing at one function looking for another's value.
  */
 
 /**
@@ -224,19 +220,25 @@ export function createBrowserWasmRecorder(options = {}) {
   });
 
   let stopped = false;
-  // Index of the export currently executing, so a write can be
-  // attributed to a position in the recording.
-  let lastFnIndex = 0;
-  // Exported memory layout, when the module publishes one. See
-  // `describeMemoryLayout`.
-  let slotNames = options.memoryLayout ?? null;
+  // Site of the innermost export frame, and so the only position this
+  // recording can attribute anything to: an import call made from
+  // inside it happens *at* that site, and the module reports no
+  // finer-grained position.
+  let currentSiteId = 0;
   // The correlation token counter lives here rather than in the
   // instrumented module so both sides of a crossing observe the same
   // value: the module calls `__ct_correlation_token()` and hands the
   // result straight back to `__ct_emit_realm_boundary`.
   let nextToken = 1n;
-  // Per-export bindings a chain crossing out of this module resumes on.
+  // Per-export overrides of the binding a chain crossing out of this
+  // module resumes on. Empty is the normal case — see the option docs.
   const returnValueNames = options.returnValueNames ?? {};
+  // Binding name the most recent result run of each export was
+  // recorded under, keyed by export index. Read when the `LEAVE`
+  // marker fires, which the instrumenter emits *after* the result
+  // tuple (spec § 5), so the name is always already known.
+  /** @type {Map<number, string>} */
+  const lastResultBinding = new Map();
 
   // Seed the session. `SessionStart` must be the first line on the wire
   // (the daemon rejects a duplicate and ignores events before it), and
@@ -257,29 +259,6 @@ export function createBrowserWasmRecorder(options = {}) {
     const fns = /** @type {{functions?: {name?: string}[]}} */ (manifest ?? {})
       .functions;
     return fns?.[fnIndex]?.name ?? "";
-  }
-
-  /**
-   * Name the ledger slot a written address falls in.
-   *
-   * A module can publish its layout (see `describeMemoryLayout`), in
-   * which case writes are recorded against meaningful names instead of
-   * bare addresses. Without a layout the address itself is the name —
-   * honest, if less readable. Nothing is invented: an address outside
-   * every declared slot keeps its numeric name.
-   *
-   * @param {number} address
-   * @returns {string}
-   */
-  function resolveSlotName(address) {
-    if (slotNames) {
-      for (const slot of slotNames) {
-        if (address >= slot.start && address < slot.start + slot.size) {
-          return slot.name;
-        }
-      }
-    }
-    return `mem[${address}]`;
   }
 
   /**
@@ -312,7 +291,17 @@ export function createBrowserWasmRecorder(options = {}) {
       key,
       payload: label,
     };
-    const returnValueName = returnValueNames[exportName(fnIndex)];
+    // The value that crossed outward is the export's result, and this
+    // runtime has just recorded it under a name of its own choosing —
+    // so it can name the crossing binding itself rather than asking
+    // the module to declare one. An explicit override still wins.
+    //
+    // A `LEAVE` with no result run leaves this unset, which is
+    // correct: a `-> ()` export sent no value, and pointing the walk
+    // at a binding that does not exist would make an empty
+    // continuation look like a failed lookup.
+    const returnValueName =
+      returnValueNames[exportName(fnIndex)] ?? lastResultBinding.get(fnIndex);
     if (leaving && returnValueName) {
       wasmMarker.showText = returnValueName;
     }
@@ -379,72 +368,55 @@ export function createBrowserWasmRecorder(options = {}) {
   /**
    * Emit the buffered run as bindings of `frame` and return it.
    *
+   * A `FUNC_KIND_STORE` group is dropped without a trace, which is
+   * the whole of M36's browser-side change: the interior model is
+   * withdrawn (spec §§ 2, 11) and the browser pipeline records
+   * nothing from it. The run is still consumed rather than left in
+   * the buffer, because a buffer carried across a group boundary
+   * would reappear as somebody else's argument tuple.
+   *
    * @param {{fnKind: number, fnIndex: number}|null|undefined} frame
    * @param {"arg"|"ret"} role
-   * @returns {{slot: number, value: number, typeKind: string}[]}
+   * @returns {{slot: number, value: number|string, typeKind: string}[]}
    */
   function flushValues(frame, role) {
     const run = pendingValues;
     pendingValues = [];
     pendingOwner = null;
     if (!frame || run.length === 0) return [];
-    if (frame.fnKind === FUNC_KIND_STORE) {
-      emitStoreEvent(frame, run);
-      return run;
-    }
+    if (frame.fnKind === FUNC_KIND_STORE) return [];
     const label =
       frame.fnKind === FUNC_KIND_EXPORT
         ? exportName(frame.fnIndex)
         : `import #${frame.fnIndex}`;
+    // Each tuple gets a step of its own, and it has to: an origin walk
+    // finds a binding's write by looking for the step where its value
+    // first appears, which means there must be an earlier step in the
+    // same frame where it did not. Arguments and results recorded onto
+    // the frame's single entry step would be indistinguishable from
+    // values that were always there, and the walk would run off the
+    // start of the recording instead of landing on the module.
+    producer.send({ kind: "Step", siteId: currentSiteId });
     for (const entry of run) {
+      const name = boundaryBindingName(label, role, entry.slot);
+      const isExportResult =
+        role === "ret" && frame.fnKind === FUNC_KIND_EXPORT && entry.slot === 0;
+      if (isExportResult) {
+        // Remember the binding the outbound value landed in, so the
+        // `LEAVE` marker that follows can name it without the module
+        // having to declare it. Slot 0 because a chain follows one
+        // value, and the first result is the one a single-value
+        // return — every case a C-ABI `cdylib` can produce — puts it
+        // in.
+        lastResultBinding.set(frame.fnIndex, name);
+      }
       producer.send({
         kind: "Value",
-        name: `${label}:${role}${entry.slot}`,
+        name,
         value: { value: entry.value, typeKind: entry.typeKind },
       });
     }
     return run;
-  }
-
-  /**
-   * Render one store-event group.
-   *
-   * The interior store pass is withdrawn by spec §§ 2 and 11 and is
-   * retired in M36; it survives here only so an experiment run with
-   * `instrument_stores = true` still produces the same recording it
-   * did before the write hook left the surface. Its value tuple is
-   * `(addr, old, new)`, and `fn_index` is the store's byte width.
-   *
-   * @param {{fnKind: number, fnIndex: number}} frame
-   * @param {{slot: number, value: number|string, typeKind: string}[]} run
-   */
-  function emitStoreEvent(frame, run) {
-    const address = Number(run[0]?.value ?? 0) >>> 0;
-    const oldValue = run[1]?.value ?? 0;
-    const newValue = run[2]?.value ?? 0;
-    const size = frame.fnIndex >>> 0;
-    // A `Step` precedes each write so the recording has a position to
-    // stop at, giving the write somewhere to attach.
-    producer.send({ kind: "Step", siteId: lastFnIndex });
-    producer.send({
-      kind: "Value",
-      name: resolveSlotName(address),
-      // The stored value comes through the `i64` slot of the group, so
-      // it carries whatever type kind `recordValue` settled on — never
-      // a hard-coded `Int`, which would relabel an exact 64-bit
-      // decimal as a number the receiver would try to narrow.
-      value: { value: newValue, typeKind: run[2]?.typeKind ?? "Int" },
-    });
-    // The previous value goes to the event log rather than the state
-    // pane: it is history, not current state, and showing both as
-    // bindings would make every slot appear twice.
-    producer.send({
-      kind: "Write",
-      channel: "wasm-memory",
-      content:
-        `store ${resolveSlotName(address)} (addr=${address}, ${size}B): ` +
-        `${String(oldValue)} -> ${String(newValue)}`,
-    });
   }
 
   return {
@@ -493,7 +465,7 @@ export function createBrowserWasmRecorder(options = {}) {
         // are recorded as the boundary markers below rather than as
         // frames of this recording. Store groups are not calls at all.
         if (frame.fnKind !== FUNC_KIND_EXPORT) return;
-        lastFnIndex = frame.fnIndex;
+        currentSiteId = frame.fnIndex;
         producer.send({ kind: "Step", siteId: frame.fnIndex });
         producer.send({ kind: "Call", fnId: frame.fnIndex, args: [] });
       },
@@ -535,20 +507,6 @@ export function createBrowserWasmRecorder(options = {}) {
         nextToken += 1n;
         return t;
       },
-    },
-
-    /**
-     * Attach a memory layout discovered after instantiation.
-     *
-     * The layout has to come from the instantiated module (it reports
-     * its own base address), which is necessarily after the recorder
-     * was constructed — hence a setter rather than a constructor
-     * option. Writes recorded before this point keep their address
-     * names; in practice nothing runs between instantiation and this
-     * call.
-     */
-    setMemoryLayout(layout) {
-      slotNames = layout ?? null;
     },
 
     /** Force any buffered events onto the wire. */

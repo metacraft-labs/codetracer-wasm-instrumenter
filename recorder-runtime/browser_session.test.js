@@ -18,6 +18,7 @@ import {
   createBrowserWasmRecorder,
   FUNC_KIND_EXPORT,
   FUNC_KIND_IMPORT,
+  FUNC_KIND_STORE,
   REALM_DIRECTION_ENTER,
   REALM_DIRECTION_LEAVE,
 } from "./browser_session.js";
@@ -197,6 +198,160 @@ test("a void export does not report its arguments as a return value", () => {
     ["balance_of:arg0"],
     "the single run belongs to the argument side",
   );
+});
+
+// --- M36: the interior store pass is retired from the browser path ------
+
+test("a store group puts nothing on the wire", () => {
+  const { r, transport } = recorder();
+  // The shape an `instrument_stores = true` module emits for one
+  // `i32.store`: a group header whose `fn_index` is the byte width,
+  // the `(addr, old, new)` tuple, and the closing marker.
+  r.imports.__ct_emit_call(FUNC_KIND_STORE, 4);
+  r.imports.__ct_emit_i32(0, 1049372);
+  r.imports.__ct_emit_i32(1, 0);
+  r.imports.__ct_emit_i32(2, 620);
+  r.imports.__ct_emit_return(FUNC_KIND_STORE, 4);
+  r.stop();
+
+  const kinds = transport.lines().map((l) => l.kind);
+  assert.deepEqual(
+    kinds,
+    ["SessionStart", "Manifest", "SessionEnd"],
+    "the store pass is withdrawn (spec §§ 2, 11): no Step, no Value, no Write",
+  );
+});
+
+test("a store group inside an export does not disturb the boundary framing", () => {
+  // The regression this guards: a run buffered by a store group and
+  // never consumed would be re-flushed as the *next* group's tuple,
+  // so the export's result would be reported as `620, 1049372, 0`.
+  // Dropping the group's values is not enough — they have to be
+  // dropped at the point the group closes.
+  const { r, transport } = recorder();
+  r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_i32(0, 42);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  r.imports.__ct_emit_call(FUNC_KIND_STORE, 4);
+  r.imports.__ct_emit_i32(0, 1049372);
+  r.imports.__ct_emit_i32(1, 0);
+  r.imports.__ct_emit_i32(2, 620);
+  r.imports.__ct_emit_return(FUNC_KIND_STORE, 4);
+  r.imports.__ct_emit_i32(0, 620);
+  r.imports.__ct_emit_return(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_LEAVE,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  r.stop();
+
+  const values = transport.lines().filter((l) => l.kind === "Value");
+  assert.deepEqual(
+    values.map((v) => `${v.name}=${v.value.value}`),
+    ["balance_of:arg0=42", "balance_of:ret0=620"],
+    "only the boundary tuples are recorded, and they keep their sides",
+  );
+  const ret = transport.lines().find((l) => l.kind === "Return");
+  assert.deepEqual(ret.returnValue, { value: 620, typeKind: "Int" });
+});
+
+test("each boundary tuple lands on a step of its own", () => {
+  // Load-bearing, not cosmetic. An origin walk locates a binding's
+  // write by finding the step where its value first appears, which
+  // requires an earlier step in the same frame where it did not. With
+  // the arguments and the result on the frame's single entry step, a
+  // chain crossing into this recording finds no change and walks off
+  // the start of the recording instead of landing on the module.
+  const { r, transport } = recorder();
+  r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_i32(0, 42);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  r.imports.__ct_emit_i32(0, 620);
+  r.imports.__ct_emit_return(FUNC_KIND_EXPORT, 0);
+  r.stop();
+
+  // Reconstruct which step each binding was recorded against, the way
+  // the daemon's writer does: a `Value` belongs to the most recent
+  // `Step`.
+  const stepOf = new Map();
+  let step = -1;
+  for (const line of transport.lines()) {
+    if (line.kind === "Step") step += 1;
+    if (line.kind === "Value") stepOf.set(line.name, step);
+  }
+  assert.equal(stepOf.get("balance_of:arg0"), 1, "entry step, then arguments");
+  assert.equal(stepOf.get("balance_of:ret0"), 2, "then results");
+});
+
+// --- the binding an origin chain resumes on ------------------------------
+
+/** The outbound (`send`) realm marker of the first crossing. */
+function outboundMarker(transport) {
+  return transport
+    .lines()
+    .find((l) => l.kind === "CorrelationMarker" && l.direction === "send");
+}
+
+/** Drive one export call returning `results`, with `options` on the recorder. */
+function callExport(options, results) {
+  const { r, transport } = recorder(options);
+  r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_i32(0, 42);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  results.forEach((v, slot) => r.imports.__ct_emit_i32(slot, v));
+  r.imports.__ct_emit_return(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_LEAVE,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  r.stop();
+  return transport;
+}
+
+test("the outbound marker names the export's own result binding", () => {
+  // Under the withdrawn store model the crossing binding was a
+  // linear-memory slot the module had to publish, so the page had to
+  // declare its name. The value that leaves a WebAssembly export is
+  // its result, and the recorder has just recorded it under a name of
+  // its own — so it names the crossing itself, and a module needs no
+  // annotation. An origin chain arriving from the page resumes here.
+  const transport = callExport({}, [620]);
+  assert.equal(outboundMarker(transport).showText, "balance_of:ret0");
+});
+
+test("an explicit returnValueNames entry overrides the default", () => {
+  const transport = callExport(
+    { returnValueNames: { balance_of: "handle" } },
+    [620],
+  );
+  assert.equal(outboundMarker(transport).showText, "handle");
+});
+
+test("a void export's outbound marker names no binding", () => {
+  // Pointing a chain at a binding that does not exist would turn
+  // "this export sent nothing" into what looks like a failed lookup
+  // in the sibling recording.
+  const transport = callExport({}, []);
+  assert.equal(outboundMarker(transport).showText, undefined);
 });
 
 test("every line put on the wire is serialisable JSON", () => {

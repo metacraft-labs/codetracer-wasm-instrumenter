@@ -14,14 +14,35 @@
 //! `crates/codetracer-wasm-stub-host/tests/parity.rs` for the
 //! cross-modality parity check (#4).
 
-use codetracer_wasm_instrumenter::Pipeline;
+use codetracer_wasm_instrumenter::{Pipeline, PipelineConfig};
 use codetracer_wasm_stub_host::{record_instrumented, Event};
 
-fn instrument_wat(wat: &str) -> Vec<u8> {
+fn instrument_with(wat: &str, config: PipelineConfig) -> Vec<u8> {
     let original = wat::parse_str(wat).expect("input WAT must compile");
-    Pipeline::new()
+    Pipeline::with_config(config)
         .run_bytes(&original)
         .expect("pipeline must succeed")
+}
+
+/// The production rewrite: boundary-only, per spec §§ 1–3.
+fn instrument_wat(wat: &str) -> Vec<u8> {
+    instrument_with(wat, PipelineConfig::default())
+}
+
+/// The withdrawn interior model, asked for explicitly.
+///
+/// M36 took the store pass off the default path (spec §§ 2, 11) but
+/// left it reachable behind the flag, so the two tests that cover it
+/// now say so. Nothing about what the pass emits changed — only who
+/// asks for it.
+fn instrument_wat_with_stores(wat: &str) -> Vec<u8> {
+    instrument_with(
+        wat,
+        PipelineConfig {
+            instrument_stores: true,
+            ..PipelineConfig::default()
+        },
+    )
 }
 
 #[test]
@@ -53,7 +74,7 @@ fn test_wasm_recorder_runtime_emits_store_events() {
             i32.const 0xdd
             i32.store))
     "#;
-    let instrumented = instrument_wat(wat);
+    let instrumented = instrument_wat_with_stores(wat);
     let events = record_instrumented(&instrumented).expect("walk");
 
     let writes: Vec<&Event> = events
@@ -101,7 +122,7 @@ fn test_wasm_recorder_runtime_emits_store_events_mixed_widths() {
             f64.const 2.5
             f64.store))        ;; size 8
     "#;
-    let instrumented = instrument_wat(wat);
+    let instrumented = instrument_wat_with_stores(wat);
     let events = record_instrumented(&instrumented).expect("walk");
     let sizes: Vec<u32> = events
         .iter()

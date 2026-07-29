@@ -46,6 +46,18 @@ fn record(
 
 /// Run the original and the instrumented module side by side and
 /// require them to agree on everything observable.
+///
+/// Both rewrite configurations are checked, and the store one is not
+/// optional. Non-interference is the property that does not care which
+/// pass is enabled — it is a statement about the rewriter, not about
+/// what gets reported — and the store pass is the *more* invasive of
+/// the two: it reloads the old value at every store site, which is
+/// exactly the kind of splice that could disturb the operand stack or
+/// clobber memory. Until M36 this function inherited the store pass
+/// from `PipelineConfig::default()`; when that default flipped to
+/// boundary-only the coverage would have quietly disappeared with it,
+/// which is why the configurations are named here rather than
+/// inherited.
 fn assert_computes_identically(
     wat: &str,
     export: &str,
@@ -53,23 +65,38 @@ fn assert_computes_identically(
     stubs: &[ImportStub],
 ) {
     let original = wat::parse_str(wat).expect("input WAT must compile");
-    let instrumented = Pipeline::new().run_bytes(&original).expect("instrument");
-
     let before = run_module(&original, export, args, stubs).expect("original run");
-    let after = run_module(&instrumented, export, args, stubs).expect("instrumented run");
-
-    assert_eq!(
-        before.results, after.results,
-        "instrumentation changed the value `{export}` returned"
-    );
-    assert_eq!(
-        before.memory, after.memory,
-        "instrumentation changed what `{export}` wrote to memory"
-    );
     assert!(
         before.events.is_empty(),
         "the original module must emit no hook events"
     );
+
+    let configs = [
+        ("boundary-only (the default)", PipelineConfig::default()),
+        (
+            "boundary + the interior store pass",
+            PipelineConfig {
+                instrument_stores: true,
+                ..PipelineConfig::default()
+            },
+        ),
+    ];
+
+    for (label, config) in configs {
+        let instrumented = Pipeline::with_config(config)
+            .run_bytes(&original)
+            .expect("instrument");
+        let after = run_module(&instrumented, export, args, stubs).expect("instrumented run");
+
+        assert_eq!(
+            before.results, after.results,
+            "instrumentation changed the value `{export}` returned ({label})"
+        );
+        assert_eq!(
+            before.memory, after.memory,
+            "instrumentation changed what `{export}` wrote to memory ({label})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,19 +536,31 @@ fn verify_emit_write_hook_is_gone() {
             local.get 1
             i32.store))
     "#;
-    let instrumented = instrument(wat);
-    let module = walrus::Module::from_buffer(&instrumented).expect("re-parse");
-    let imported: Vec<String> = module.imports.iter().map(|i| i.name.clone()).collect();
+    // Two configurations, because the store pass is the one most
+    // likely to bring the hook back and M36 took it off the default
+    // path — checking only the default would stop exercising it.
+    let store_pass_on = PipelineConfig {
+        instrument_stores: true,
+        ..PipelineConfig::default()
+    };
     assert!(
-        !imported.contains(&withdrawn),
-        "an instrumented module still imports the withdrawn hook: {imported:?}"
+        store_pass_on.instrument_stores && !PipelineConfig::default().instrument_stores,
+        "M36: boundary-only by default, the store pass reachable behind the flag"
     );
-    // Even with the experimental store pass on (it still is, until
-    // M36), which is the configuration most likely to bring it back.
-    assert!(
-        PipelineConfig::default().instrument_stores,
-        "this assertion is only meaningful while the store pass is on"
-    );
+    for config in [PipelineConfig::default(), store_pass_on] {
+        let with_stores = config.instrument_stores;
+        let original = wat::parse_str(wat).expect("input WAT must compile");
+        let instrumented = Pipeline::with_config(config)
+            .run_bytes(&original)
+            .expect("pipeline must succeed");
+        let module = walrus::Module::from_buffer(&instrumented).expect("re-parse");
+        let imported: Vec<String> = module.imports.iter().map(|i| i.name.clone()).collect();
+        assert!(
+            !imported.contains(&withdrawn),
+            "an instrumented module still imports the withdrawn hook \
+             (instrument_stores={with_stores}): {imported:?}"
+        );
+    }
 
     let crates_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

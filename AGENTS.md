@@ -36,7 +36,7 @@ yourself needing a tool that is not in `flake.nix`, add it to `flake.nix`.
 | Command                        | What it does                                                     |
 | ------------------------------ | ---------------------------------------------------------------- |
 | `just build`                   | `cargo build --workspace --release --locked`                     |
-| `just test`                    | `cargo test --workspace --locked` — the whole suite (53 tests)    |
+| `just test`                    | `cargo test --workspace --locked` — the whole suite (55 tests)    |
 | `just test-plugins`            | `node --test` over the bundler plugin wrappers in `plugins/`      |
 | `just test-runtime`            | `node --test` over the shims in `recorder-runtime/`               |
 | `just lint`                    | `cargo clippy … -D warnings`, `cargo fmt --check`, `nixfmt --check` |

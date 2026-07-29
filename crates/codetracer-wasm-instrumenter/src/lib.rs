@@ -60,11 +60,13 @@
 //!
 //! An experimental interior pass behind
 //! [`PipelineConfig::instrument_stores`] additionally reports every
-//! memory store. It is **not** part of any production path — spec
-//! §§ 2 and 11 withdraw the interior model — and M36 retires it. It
-//! now reports through the surviving hook surface (see
-//! [`hooks::FUNC_KIND_STORE`]) rather than the withdrawn per-store
-//! write hook.
+//! memory store. It is **off by default** and **not** part of any
+//! production path — spec §§ 2 and 11 withdraw the interior model,
+//! and M36 retired it from the default rewrite. The pass survives
+//! only as a reachable experiment; nothing in the browser pipeline
+//! consumes its events. It reports through the surviving hook
+//! surface (see [`hooks::FUNC_KIND_STORE`]) rather than the
+//! withdrawn per-store write hook.
 //!
 //! ## What the pipeline does **not** do (deferred, documented)
 //!
@@ -1866,6 +1868,11 @@ mod tests {
     /// the count of headers alone would pass for a group that reported
     /// an address and nothing else; the tuple is checked explicitly
     /// below to keep the assertion as strong as the one it replaced.
+    ///
+    /// The pass is off by default from M36 on (spec §§ 2, 11), so this
+    /// test asks for it explicitly. It is still worth keeping: the
+    /// pass stays reachable behind the flag, and a reachable pass that
+    /// nothing exercises rots.
     #[test]
     fn single_i32_store_instrumented_once() {
         let wat = r#"
@@ -1877,7 +1884,12 @@ mod tests {
                 i32.store))
         "#;
         let input = wat::parse_str(wat).unwrap();
-        let out = Pipeline::new().run_bytes(&input).unwrap();
+        let out = Pipeline::with_config(PipelineConfig {
+            instrument_stores: true,
+            ..PipelineConfig::default()
+        })
+        .run_bytes(&input)
+        .unwrap();
         let module = Module::from_buffer(&out).unwrap();
 
         // A store now reports through the group header

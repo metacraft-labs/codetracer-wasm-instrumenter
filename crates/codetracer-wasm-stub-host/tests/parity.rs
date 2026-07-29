@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use codetracer_wasm_instrumenter::Pipeline;
+use codetracer_wasm_instrumenter::{Pipeline, PipelineConfig};
 use codetracer_wasm_stub_host::{assert_parity, record_instrumented, record_interpreter};
 
 fn golden_path(name: &str) -> Option<PathBuf> {
@@ -38,9 +38,26 @@ fn golden_path(name: &str) -> Option<PathBuf> {
 fn parity_one(path: &Path) {
     let bytes = std::fs::read(path).expect("read input wasm");
     let original_events = record_interpreter(&bytes).expect("oracle walk");
-    let instrumented = Pipeline::new()
-        .run_bytes(&bytes)
-        .expect("instrument failed");
+    // `record_interpreter` is an *interior-model* oracle: it walks the
+    // original module and reports a `Write` for every store it finds.
+    // The rewrite it is the oracle for is therefore the one that also
+    // instruments stores, which M36 took off the default path (spec
+    // §§ 2, 11) without removing. Running the default here instead
+    // would not be a weaker parity check, it would be a comparison
+    // between two different questions — the oracle would report writes
+    // the module was never asked to report.
+    //
+    // Spec § 10 replaces this structural check with an end-to-end one
+    // (materialised trace vs materialised trace) once the replayer of
+    // M37 exists. Until then this remains the strongest available
+    // statement that the rewriter preserves the event stream, and it
+    // covers the boundary events of the default rewrite as a subset.
+    let instrumented = Pipeline::with_config(PipelineConfig {
+        instrument_stores: true,
+        ..PipelineConfig::default()
+    })
+    .run_bytes(&bytes)
+    .expect("instrument failed");
     let observed_events = record_instrumented(&instrumented).expect("observer walk");
     assert_parity(&original_events, &observed_events).expect("parity failed");
 }
