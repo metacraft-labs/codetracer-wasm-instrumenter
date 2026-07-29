@@ -1,0 +1,66 @@
+default:
+    @just --list
+
+alias t := test
+alias fmt := format
+
+# --- Build ------------------------------------------------------------
+
+# Build every workspace member (library, stub host, host-module framework
+# and the `ct-instrument` CLI).
+build: build-rust
+
+# Release build of the whole cargo workspace.  `--locked` because
+# `Cargo.lock` is committed: the build must fail rather than silently
+# re-resolve if a member's manifest drifts from the pinned resolution.
+build-rust:
+    cargo build --workspace --release --locked
+
+# Cross-check that the dev shell really carries the `wasm32-unknown-unknown`
+# rust-std the instrumentation pipeline's consumers compile guest code with.
+build-wasm-target-check:
+    rustc --print target-libdir --target wasm32-unknown-unknown
+
+# --- Test -------------------------------------------------------------
+
+# Run the full test suite.
+test: test-rust
+
+# Whole-workspace cargo test run (unit tests + the `verification`,
+# `parity`, `cli_smoke`, `factory_logs_all_calls` and `stylus_parity`
+# integration suites).
+test-rust:
+    cargo test --workspace --locked
+
+# The bundler plugin wrappers under `plugins/` are plain ESM modules
+# tested with node's built-in runner.  They are not part of `test`
+# because they only shell out to the CLI built by `build-rust`.
+test-plugins:
+    for p in plugins/*/; do (cd "$p" && node --test index.test.js); done
+
+# --- Lint -------------------------------------------------------------
+
+lint: lint-rust lint-nix
+
+lint-rust:
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo fmt --all -- --check
+
+lint-nix:
+    nixfmt --check flake.nix
+
+# --- Format -----------------------------------------------------------
+
+format: format-rust format-nix
+
+format-rust:
+    cargo fmt --all
+
+format-nix:
+    nixfmt flake.nix
+
+# --- Nix --------------------------------------------------------------
+
+# Verify the flake's default package builds.
+nix-build:
+    nix build .#default
