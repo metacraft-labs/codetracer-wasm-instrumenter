@@ -19,6 +19,14 @@ walrus       = "0.26"
 wasmparser   = "0.245"
 wasmprinter  = "0.245"
 wat          = "1.245"
+# A real WASM engine for the runtime half of the test suite: boundary
+# value capture can only be verified by *executing* an instrumented
+# module and reading the values the hooks actually receive, and by
+# executing the original alongside it to prove the rewrite did not
+# perturb the computation (spec §10 parity). 0.31 is the last release
+# with the pre-0.32 `Value`/`Linker` API this harness is written
+# against.
+wasmi        = "0.31.2"
 anyhow       = "1"
 thiserror    = "1"
 clap         = { version = "4", features = ["derive"] }

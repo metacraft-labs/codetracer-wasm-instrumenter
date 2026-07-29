@@ -19,23 +19,13 @@
 //! [`hooks::HOOK_*`] imports, emits a deterministic sequence of
 //! CodeTracer events covering:
 //!
-//! 1. **Memory stores** — every `i32.store` / `i64.store` /
-//!    `f32.store` / `f64.store` (and the sized variants like
-//!    `i32.store8`) emits an `__ct_emit_write(addr, size, old, new)`
-//!    call right after the store completes. The hook receives the
-//!    effective address (i.e. base + static offset), the byte size
-//!    of the store, and both the **previous** and the **new** value
-//!    in the same 64-bit slot (zero-extended for narrower stores,
-//!    bit-reinterpreted for floats so the receiver sees a stable
-//!    bit pattern).
-//!
-//! 2. **Imported call boundaries** — every `call` whose target is
+//! 1. **Imported call boundaries** — every `call` whose target is
 //!    an imported function is preceded by `__ct_emit_call(0,
 //!    fn_index)` and followed by `__ct_emit_return(0, fn_index)`.
 //!    These are the natural realm-crossing points in a browser
 //!    embedding (host calls from WASM into JS).
 //!
-//! 3. **Exported function boundaries** — every function reachable
+//! 2. **Exported function boundaries** — every function reachable
 //!    via an `export` entry receives an entry-prologue
 //!    `__ct_emit_call(1, fn_index)` and a return-epilogue
 //!    `__ct_emit_return(1, fn_index)` (the export index is the
@@ -43,6 +33,16 @@
 //!    — stable across re-instrumentation). These are the natural
 //!    realm-crossing points in the reverse direction (calls from
 //!    JS into WASM).
+//!
+//! 3. **The values that cross those boundaries** — every argument
+//!    and every result, reported one at a time through the typed
+//!    `__ct_emit_{i32,i64,f32,f64}(slot, value)` hooks (M35). This
+//!    is what makes the log a *re-execution input* rather than a
+//!    call graph: without an import's recorded results the replayer
+//!    of spec § 6 has nothing to feed back in place of the real
+//!    host. Values are read without disturbing the computation by
+//!    spilling the operands into scratch locals, emitting, and
+//!    pushing them back — see [`push_value_capture_group`].
 //!
 //! 4. **Realm-crossing correlation tokens** — both directions also
 //!    emit a paired
@@ -58,6 +58,14 @@
 //! (modulo timestamps / counter state, which are runtime concerns
 //! not embedded in the module).
 //!
+//! An experimental interior pass behind
+//! [`PipelineConfig::instrument_stores`] additionally reports every
+//! memory store. It is **not** part of any production path — spec
+//! §§ 2 and 11 withdraw the interior model — and M36 retires it. It
+//! now reports through the surviving hook surface (see
+//! [`hooks::FUNC_KIND_STORE`]) rather than the withdrawn per-store
+//! write hook.
+//!
 //! ## What the pipeline does **not** do (deferred, documented)
 //!
 //! - Multi-memory write tracking (the `memory_id` field is captured
@@ -71,19 +79,41 @@
 //! - Atomic stores: instrumented like regular stores but the
 //!   pre-read is non-atomic — sufficient for single-threaded
 //!   browser pages, insufficient for shared-memory threads.
+//! - Boundary signatures carrying `externref` / `funcref` / `v128`:
+//!   the module is **rejected** with a diagnostic naming the
+//!   function rather than recorded with a hole in its value stream
+//!   (spec § 8).
+//! - Exit sites reached by branching to the function's own label
+//!   (`br` / `br_if` / `br_table` targeting the body) carry neither
+//!   the leave event nor the result capture. Only the fall-through
+//!   exit and explicit `return` are covered — the same set the V1
+//!   leave event covered, so this is a pre-existing gap rather than
+//!   one value capture introduces. The consequence is a *missing*
+//!   record, never a wrong one: the computation is untouched either
+//!   way.
 
 #![deny(rust_2018_idioms, unused_must_use)]
 #![warn(missing_docs)]
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::Path;
 use walrus::ir::{BinaryOp, ExtendedLoad, Instr, InstrSeqId, LoadKind, MemArg, StoreKind, UnaryOp};
 use walrus::{FunctionId, FunctionKind, LocalId, MemoryId, Module, ModuleConfig, ValType};
 
 pub mod config;
+pub mod dwarf;
 pub mod hooks;
+pub mod manifest;
+
+use hooks::{
+    FUNC_KIND_EXPORT, FUNC_KIND_IMPORT, FUNC_KIND_STORE, REALM_DIRECTION_ENTER,
+    REALM_DIRECTION_LEAVE,
+};
 
 pub use config::PipelineConfig;
+pub use manifest::{
+    BoundarySignature, ManifestBoundary, ManifestFunction, ManifestSite, ModuleManifest, ScalarType,
+};
 
 /// One-shot bytecode-rewriting pipeline.
 ///
@@ -117,19 +147,76 @@ impl Pipeline {
     /// [`walrus::Module::from_buffer`] so a malformed module is
     /// rejected up-front (V1 returns the underlying walrus error).
     pub fn run_bytes(&self, input: &[u8]) -> Result<Vec<u8>> {
+        Ok(self.run_bytes_with_manifest(input, None)?.0)
+    }
+
+    /// Instrument `input` and additionally return the sidecar
+    /// [`ModuleManifest`] describing the module's export table.
+    ///
+    /// The manifest is what turns the runtime's bare `fn_index` integers
+    /// back into names and source paths; an embedder that records a
+    /// module without shipping it produces a trace whose frames are
+    /// anonymous. `source_path` names the source the module was compiled
+    /// from (see [`ModuleManifest::from_module`] for why it cannot be
+    /// inferred).
+    ///
+    /// The manifest is built from the module **before** instrumentation
+    /// registers the hook imports, so the indices it records are the ones
+    /// the original module — and therefore the injected hook calls —
+    /// refer to.
+    pub fn run_bytes_with_manifest(
+        &self,
+        input: &[u8],
+        source_path: Option<&str>,
+    ) -> Result<(Vec<u8>, ModuleManifest)> {
         let mut module = Module::from_buffer_with_config(input, &walrus_config())
             .context("failed to parse input WASM module")?;
+        let module_name = module
+            .name
+            .clone()
+            .unwrap_or_else(|| "module.wasm".to_string());
+        let manifest = ModuleManifest::from_module(&module, input, source_path, &module_name);
         self.instrument_module(&mut module)?;
-        Ok(module.emit_wasm())
+        Ok((module.emit_wasm(), manifest))
     }
 
     /// Read `input` from disk, instrument, and write to `output`.
     pub fn run_files<P: AsRef<Path>, Q: AsRef<Path>>(&self, input: P, output: Q) -> Result<()> {
+        self.run_files_with_manifest(input, output, None::<&Path>, None)
+    }
+
+    /// [`Pipeline::run_files`] plus sidecar-manifest emission.
+    ///
+    /// When `manifest_output` is `Some`, the manifest JSON is written
+    /// there. `source_path` is forwarded to
+    /// [`ModuleManifest::from_module`].
+    pub fn run_files_with_manifest<P: AsRef<Path>, Q: AsRef<Path>, M: AsRef<Path>>(
+        &self,
+        input: P,
+        output: Q,
+        manifest_output: Option<M>,
+        source_path: Option<&str>,
+    ) -> Result<()> {
         let bytes = std::fs::read(input.as_ref())
             .with_context(|| format!("failed to read {}", input.as_ref().display()))?;
-        let instrumented = self.run_bytes(&bytes)?;
+        // Without an explicit source path, fall back to the input
+        // module's own filename so the manifest still names something
+        // real rather than a fabricated source file.
+        let fallback_name = input
+            .as_ref()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        let effective_source = source_path.or(fallback_name.as_deref());
+        let (instrumented, manifest) = self.run_bytes_with_manifest(&bytes, effective_source)?;
         std::fs::write(output.as_ref(), instrumented)
             .with_context(|| format!("failed to write {}", output.as_ref().display()))?;
+        if let Some(manifest_path) = manifest_output {
+            let json = manifest
+                .to_json()
+                .context("failed to serialise the instrumentation manifest")?;
+            std::fs::write(manifest_path.as_ref(), json)
+                .with_context(|| format!("failed to write {}", manifest_path.as_ref().display()))?;
+        }
         Ok(())
     }
 
@@ -147,17 +234,48 @@ impl Pipeline {
         let imported_funcs = collect_imported_function_indices(module);
         let exported_targets = collect_exported_function_targets(module);
 
+        // Spec § 8: refuse a module whose boundary signatures carry a
+        // type the value hooks cannot transport, rather than emitting
+        // a recording with a hole in it. A silently incomplete
+        // recording replays fine right up until the missing input
+        // matters, and then diverges at a point unrelated to the
+        // cause — the most expensive failure mode there is.
+        if self.config.capture_boundary_values {
+            reject_unrepresentable_boundaries(module, &imported_funcs, &exported_targets)?;
+        }
+
         let hook_ids = HookFunctionIds::register(module, &self.config);
         let memories = collect_memory_ids(module);
+
+        // `iter_local_mut` / `funcs.get_mut` borrow the function arena
+        // exclusively, so every local this run needs has to exist
+        // before the walk starts. Size the pool to the widest boundary
+        // tuple in the module: that is what makes the spill correct
+        // for a multi-value return, where several results of the same
+        // type are live at once and must not share one slot.
+        let scratch = if self.config.capture_boundary_values {
+            let mut widths = TypeCounts::default();
+            for sig in imported_funcs
+                .signatures()
+                .chain(exported_targets.iter().map(|(_, _, sig)| sig))
+            {
+                widths.take_max(&TypeCounts::of(&sig.params));
+                widths.take_max(&TypeCounts::of(&sig.results));
+            }
+            ScratchPool::pre_allocate(module, &widths)
+        } else {
+            ScratchPool::default()
+        };
+        let values = self.config.capture_boundary_values.then_some(&scratch);
 
         if self.config.instrument_stores {
             self.instrument_stores(module, &hook_ids, &memories)?;
         }
         if self.config.instrument_imported_calls {
-            self.instrument_imported_calls(module, &hook_ids, &imported_funcs)?;
+            self.instrument_imported_calls(module, &hook_ids, &imported_funcs, values)?;
         }
         if self.config.instrument_exported_functions {
-            self.instrument_exported_functions(module, &hook_ids, &exported_targets)?;
+            self.instrument_exported_functions(module, &hook_ids, &exported_targets, values)?;
         }
 
         // Record a build-time marker so downstream tooling can
@@ -198,11 +316,13 @@ impl Pipeline {
         module: &mut Module,
         hook_ids: &HookFunctionIds,
         imported_funcs: &ImportedFuncSet,
+        scratch: Option<&ScratchPool>,
     ) -> Result<()> {
         for (_func_id, local_func) in module.funcs.iter_local_mut() {
             ImportedCallRewriter {
                 hook_ids,
                 imported_funcs,
+                scratch,
             }
             .rewrite(local_func);
         }
@@ -213,20 +333,70 @@ impl Pipeline {
         &self,
         module: &mut Module,
         hook_ids: &HookFunctionIds,
-        exports: &[(FunctionId, u32)],
+        exports: &[(FunctionId, u32, BoundarySignature)],
+        scratch: Option<&ScratchPool>,
     ) -> Result<()> {
-        for &(func_id, export_index) in exports {
+        for (func_id, export_index, sig) in exports {
             // Only local functions can be wrapped — re-exporting an
             // imported function would mean the call dispatches
             // straight to the host, so the boundary is already
             // recorded by `instrument_imported_calls`.
-            let kind = &module.funcs.get(func_id).kind;
+            let kind = &module.funcs.get(*func_id).kind;
             if matches!(kind, FunctionKind::Local(_)) {
-                wrap_local_function_boundary(module, func_id, export_index, hook_ids);
+                wrap_local_function_boundary(
+                    module,
+                    *func_id,
+                    *export_index,
+                    hook_ids,
+                    sig,
+                    scratch,
+                );
             }
         }
         Ok(())
     }
+}
+
+/// Spec § 8: a boundary whose signature mentions a type the value
+/// hooks cannot carry is a hard error naming the offending function.
+fn reject_unrepresentable_boundaries(
+    module: &Module,
+    imports: &ImportedFuncSet,
+    exports: &[(FunctionId, u32, BoundarySignature)],
+) -> Result<()> {
+    let describe = |func_id: FunctionId| -> String {
+        module
+            .funcs
+            .get(func_id)
+            .name
+            .clone()
+            .unwrap_or_else(|| "<anonymous>".to_string())
+    };
+    for (func_id, _, sig) in &imports.entries {
+        if let Some(bad) = sig.unrepresentable {
+            bail!(
+                "imported function `{}` has a boundary signature containing `{}`, \
+                 which the value-capture hooks cannot transport; \
+                 recording it would silently omit a replay input \
+                 (WASM-Instrumentation-Layer.md § 8)",
+                describe(*func_id),
+                bad,
+            );
+        }
+    }
+    for (func_id, _, sig) in exports {
+        if let Some(bad) = sig.unrepresentable {
+            bail!(
+                "exported function `{}` has a boundary signature containing `{}`, \
+                 which the value-capture hooks cannot transport; \
+                 recording it would silently omit a replay input \
+                 (WASM-Instrumentation-Layer.md § 8)",
+                describe(*func_id),
+                bad,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn walrus_config() -> ModuleConfig {
@@ -248,23 +418,28 @@ fn walrus_config() -> ModuleConfig {
 /// inserts calls to. Held by value during a single pipeline run.
 #[derive(Debug, Clone, Copy)]
 struct HookFunctionIds {
-    emit_write: FunctionId,
     emit_call: FunctionId,
     emit_return: FunctionId,
     emit_realm_boundary: FunctionId,
     correlation_token: FunctionId,
+    emit_i32: FunctionId,
+    emit_i64: FunctionId,
+    emit_f32: FunctionId,
+    emit_f64: FunctionId,
 }
 
 impl HookFunctionIds {
-    fn register(module: &mut Module, config: &PipelineConfig) -> Self {
-        // __ct_emit_write(addr: i32, size: i32, old: i64, new: i64)
-        let write_ty = module.types.add(
-            &[ValType::I32, ValType::I32, ValType::I64, ValType::I64],
-            &[],
-        );
-        let (emit_write, _) =
-            module.add_import_func(&config.host_module_name, hooks::HOOK_WRITE, write_ty);
+    /// The hook that transports one value of `ty`.
+    fn value_hook(&self, ty: ScalarType) -> FunctionId {
+        match ty {
+            ScalarType::I32 => self.emit_i32,
+            ScalarType::I64 => self.emit_i64,
+            ScalarType::F32 => self.emit_f32,
+            ScalarType::F64 => self.emit_f64,
+        }
+    }
 
+    fn register(module: &mut Module, config: &PipelineConfig) -> Self {
         // __ct_emit_call(fn_kind: i32, fn_index: i32)
         let call_ty = module.types.add(&[ValType::I32, ValType::I32], &[]);
         let (emit_call, _) =
@@ -294,14 +469,153 @@ impl HookFunctionIds {
             tok_ty,
         );
 
+        // __ct_emit_i32(slot: i32, value: i32), and one sibling per
+        // value type. Typed rather than universal because a single
+        // hook would have to widen `f32` to `f64`, which is not
+        // bit-preserving for signalling NaNs — and spec § 7 makes a
+        // NaN payload mismatch a replay divergence.
+        let mut value_hook = |name: &str, ty: ValType| {
+            let hook_ty = module.types.add(&[ValType::I32, ty], &[]);
+            module
+                .add_import_func(&config.host_module_name, name, hook_ty)
+                .0
+        };
+        let emit_i32 = value_hook(hooks::HOOK_EMIT_I32, ValType::I32);
+        let emit_i64 = value_hook(hooks::HOOK_EMIT_I64, ValType::I64);
+        let emit_f32 = value_hook(hooks::HOOK_EMIT_F32, ValType::F32);
+        let emit_f64 = value_hook(hooks::HOOK_EMIT_F64, ValType::F64);
+
         HookFunctionIds {
-            emit_write,
             emit_call,
             emit_return,
             emit_realm_boundary,
             correlation_token,
+            emit_i32,
+            emit_i64,
+            emit_f32,
+            emit_f64,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scratch locals for boundary value capture
+// ---------------------------------------------------------------------------
+
+/// A count of values per [`ScalarType`], used to size the scratch pool.
+#[derive(Debug, Default, Clone, Copy)]
+struct TypeCounts([usize; 4]);
+
+impl TypeCounts {
+    fn of(types: &[ScalarType]) -> Self {
+        let mut out = Self::default();
+        for ty in types {
+            out.0[ty.pool_slot()] += 1;
+        }
+        out
+    }
+
+    fn take_max(&mut self, other: &Self) {
+        for (mine, theirs) in self.0.iter_mut().zip(other.0.iter()) {
+            *mine = (*mine).max(*theirs);
+        }
+    }
+}
+
+/// Scratch locals the boundary passes spill operands into.
+///
+/// Walrus assigns a function's local indices at emit time from the set
+/// of locals its body actually references, so a pool allocated here can
+/// never collide with a local the input module already uses, however
+/// densely it packs its index space. Locals are per-invocation in WASM,
+/// so a recursive or re-entrant function gets its own copies and the
+/// shared pool cannot alias across frames.
+#[derive(Debug, Default, Clone)]
+struct ScratchPool {
+    /// One vector per [`ScalarType`], indexed by `ScalarType::pool_slot`.
+    by_type: [Vec<LocalId>; 4],
+}
+
+impl ScratchPool {
+    fn pre_allocate(module: &mut Module, widths: &TypeCounts) -> Self {
+        let mut pool = Self::default();
+        for (slot, count) in widths.0.iter().enumerate() {
+            let val_ty = ScalarType::from_pool_slot(slot).val_type();
+            pool.by_type[slot] = (0..*count).map(|_| module.locals.add(val_ty)).collect();
+        }
+        pool
+    }
+
+    /// The `nth` scratch local of type `ty`.
+    fn local(&self, ty: ScalarType, nth: usize) -> LocalId {
+        self.by_type[ty.pool_slot()][nth]
+    }
+}
+
+/// Emit the value-capture sequence for one tuple of operands sitting on
+/// top of the operand stack (last element on top), leaving the stack
+/// exactly as it was found.
+///
+/// This is the whole mechanism of M35 and the only reason capture is
+/// non-perturbing: an operand cannot be read in place, so each is
+/// spilled into a scratch local, reported, and pushed back in the
+/// original order. Each element gets its *own* local — sharing one per
+/// type would corrupt a multi-value return of two same-typed results.
+fn push_value_capture_group(
+    out: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
+    loc: walrus::ir::InstrLocId,
+    hook_ids: &HookFunctionIds,
+    scratch: &ScratchPool,
+    types: &[ScalarType],
+) {
+    if types.is_empty() {
+        return;
+    }
+    let mut used = TypeCounts::default();
+    let mut locals: Vec<LocalId> = Vec::with_capacity(types.len());
+    for ty in types {
+        let nth = used.0[ty.pool_slot()];
+        used.0[ty.pool_slot()] += 1;
+        locals.push(scratch.local(*ty, nth));
+    }
+
+    // Spill: the tuple's last element is on top, so pop in reverse.
+    for local in locals.iter().rev() {
+        out.push((Instr::LocalSet(walrus::ir::LocalSet { local: *local }), loc));
+    }
+    // Report, in declaration order, with the positional slot index.
+    for (slot, (local, ty)) in locals.iter().zip(types.iter()).enumerate() {
+        push_value_emit(out, loc, hook_ids, slot as i32, *local, *ty);
+    }
+    // Restore in declaration order, so the top of the stack is again
+    // the tuple's last element.
+    for local in locals.iter() {
+        out.push((Instr::LocalGet(walrus::ir::LocalGet { local: *local }), loc));
+    }
+}
+
+/// `i32.const slot; local.get value; call __ct_emit_<ty>`.
+fn push_value_emit(
+    out: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
+    loc: walrus::ir::InstrLocId,
+    hook_ids: &HookFunctionIds,
+    slot: i32,
+    local: LocalId,
+    ty: ScalarType,
+) {
+    out.push((
+        Instr::Const(walrus::ir::Const {
+            value: walrus::ir::Value::I32(slot),
+        }),
+        loc,
+    ));
+    out.push((Instr::LocalGet(walrus::ir::LocalGet { local }), loc));
+    out.push((
+        Instr::Call(walrus::ir::Call {
+            func: hook_ids.value_hook(ty),
+        }),
+        loc,
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +682,8 @@ fn collect_imported_function_indices(module: &Module) -> ImportedFuncSet {
             // include them in the wrap-target set; the synthetic
             // index counter still ticks.
             if !is_codetracer_hook_import(import) {
-                set.push(func_id, idx);
+                let sig = BoundarySignature::of_function(module, func_id);
+                set.entries.push((func_id, idx, sig));
             }
             idx += 1;
         }
@@ -376,46 +691,51 @@ fn collect_imported_function_indices(module: &Module) -> ImportedFuncSet {
     set
 }
 
+/// Does this import belong to the instrumenter's own hook surface?
+///
+/// Matched by prefix rather than by an exact name list so that a
+/// module produced by an older pipeline — which imported hooks this
+/// version no longer declares — is still recognised and not wrapped
+/// recursively.
 fn is_codetracer_hook_import(import: &walrus::Import) -> bool {
-    matches!(
-        import.name.as_str(),
-        hooks::HOOK_WRITE
-            | hooks::HOOK_CALL
-            | hooks::HOOK_RETURN
-            | hooks::HOOK_REALM_BOUNDARY
-            | hooks::HOOK_CORRELATION_TOKEN
-    )
+    let name = import.name.as_str();
+    name.starts_with("__ct_emit_") || name == hooks::HOOK_CORRELATION_TOKEN
 }
 
 #[derive(Debug, Default, Clone)]
 struct ImportedFuncSet {
     /// In-order list of imported function ids that are eligible for
     /// import-call wrapping, paired with their stable "imported
-    /// function index" in the WASM import section. The
-    /// instrumenter's own hooks are deliberately omitted from this
-    /// list so they don't get wrapped recursively, but their
-    /// section indices are still skipped so the indices we report
-    /// match the index space the original module sees.
-    entries: Vec<(FunctionId, u32)>,
+    /// function index" in the WASM import section and the boundary
+    /// signature whose values M35 captures. The instrumenter's own
+    /// hooks are deliberately omitted from this list so they don't
+    /// get wrapped recursively, but their section indices are still
+    /// skipped so the indices we report match the index space the
+    /// original module sees.
+    entries: Vec<(FunctionId, u32, BoundarySignature)>,
 }
 
 impl ImportedFuncSet {
-    fn push(&mut self, id: FunctionId, index: u32) {
-        self.entries.push((id, index));
-    }
-
-    fn index_of(&self, id: FunctionId) -> Option<u32> {
+    fn lookup(&self, id: FunctionId) -> Option<(u32, &BoundarySignature)> {
         self.entries
             .iter()
-            .find_map(|(fid, idx)| (*fid == id).then_some(*idx))
+            .find_map(|(fid, idx, sig)| (*fid == id).then_some((*idx, sig)))
+    }
+
+    fn signatures(&self) -> impl Iterator<Item = &BoundarySignature> {
+        self.entries.iter().map(|(_, _, sig)| sig)
     }
 }
 
-fn collect_exported_function_targets(module: &Module) -> Vec<(FunctionId, u32)> {
+fn collect_exported_function_targets(module: &Module) -> Vec<(FunctionId, u32, BoundarySignature)> {
     let mut out = Vec::new();
     for (idx, export) in module.exports.iter().enumerate() {
         if let walrus::ExportItem::Function(func_id) = export.item {
-            out.push((func_id, idx as u32));
+            out.push((
+                func_id,
+                idx as u32,
+                BoundarySignature::of_function(module, func_id),
+            ));
         }
     }
     out
@@ -910,37 +1230,33 @@ impl<'a> StoreRewriter<'a> {
                         arg,
                     }),
                 );
-                // Sentinel write event: addr=0, size=16, old=0, new=0.
-                push(
-                    &mut replacement,
-                    Instr::Const(walrus::ir::Const {
-                        value: walrus::ir::Value::I32(arg.offset as i32),
-                    }),
-                );
-                push(
-                    &mut replacement,
-                    Instr::Const(walrus::ir::Const {
-                        value: walrus::ir::Value::I32(size),
-                    }),
-                );
-                push(
-                    &mut replacement,
-                    Instr::Const(walrus::ir::Const {
-                        value: walrus::ir::Value::I64(0),
-                    }),
-                );
-                push(
-                    &mut replacement,
-                    Instr::Const(walrus::ir::Const {
-                        value: walrus::ir::Value::I64(0),
-                    }),
-                );
-                push(
-                    &mut replacement,
-                    Instr::Call(walrus::ir::Call {
-                        func: self.hook_ids.emit_write,
-                    }),
-                );
+                // Sentinel store event: addr=static offset, size=16,
+                // old=new=0.
+                self.push_store_group_open(&mut replacement, &push, size);
+                for (slot, value) in [
+                    (0i32, walrus::ir::Value::I32(arg.offset as i32)),
+                    (1, walrus::ir::Value::I64(0)),
+                    (2, walrus::ir::Value::I64(0)),
+                ] {
+                    push(
+                        &mut replacement,
+                        Instr::Const(walrus::ir::Const {
+                            value: walrus::ir::Value::I32(slot),
+                        }),
+                    );
+                    push(&mut replacement, Instr::Const(walrus::ir::Const { value }));
+                    push(
+                        &mut replacement,
+                        Instr::Call(walrus::ir::Call {
+                            func: if slot == 0 {
+                                self.hook_ids.emit_i32
+                            } else {
+                                self.hook_ids.emit_i64
+                            },
+                        }),
+                    );
+                }
+                self.push_store_group_close(&mut replacement, &push, size);
             }
         }
 
@@ -970,18 +1286,81 @@ impl<'a> StoreRewriter<'a> {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn emit_hook_write_i32(
+    /// Open a store-event group: `__ct_emit_call(FUNC_KIND_STORE, size)`.
+    ///
+    /// The withdrawn per-store write hook carried `(addr, size, old,
+    /// new)` in one call. That hook is gone from the surface (spec
+    /// § 5), so this experimental pass now reports the same four
+    /// fields through the hooks that remain: the group header carries
+    /// `size`, and the three values follow as a typed tuple.
+    fn push_store_group_open(
+        &self,
+        replacement: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
+        push: &impl Fn(&mut Vec<(Instr, walrus::ir::InstrLocId)>, Instr),
+        size: i32,
+    ) {
+        push(
+            replacement,
+            Instr::Const(walrus::ir::Const {
+                value: walrus::ir::Value::I32(FUNC_KIND_STORE),
+            }),
+        );
+        push(
+            replacement,
+            Instr::Const(walrus::ir::Const {
+                value: walrus::ir::Value::I32(size),
+            }),
+        );
+        push(
+            replacement,
+            Instr::Call(walrus::ir::Call {
+                func: self.hook_ids.emit_call,
+            }),
+        );
+    }
+
+    /// Close the group opened by [`Self::push_store_group_open`].
+    fn push_store_group_close(
+        &self,
+        replacement: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
+        push: &impl Fn(&mut Vec<(Instr, walrus::ir::InstrLocId)>, Instr),
+        size: i32,
+    ) {
+        push(
+            replacement,
+            Instr::Const(walrus::ir::Const {
+                value: walrus::ir::Value::I32(FUNC_KIND_STORE),
+            }),
+        );
+        push(
+            replacement,
+            Instr::Const(walrus::ir::Const {
+                value: walrus::ir::Value::I32(size),
+            }),
+        );
+        push(
+            replacement,
+            Instr::Call(walrus::ir::Call {
+                func: self.hook_ids.emit_return,
+            }),
+        );
+    }
+
+    /// Slot 0 of a store group: the effective address (base + static
+    /// offset), as an `i32`.
+    fn push_store_address(
         &self,
         replacement: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
         push: &impl Fn(&mut Vec<(Instr, walrus::ir::InstrLocId)>, Instr),
         offset_const: i32,
-        size: i32,
         addr_local: LocalId,
-        old_local: LocalId,
-        new_local: LocalId,
     ) {
-        // eff_addr = addr + offset_const
+        push(
+            replacement,
+            Instr::Const(walrus::ir::Const {
+                value: walrus::ir::Value::I32(0),
+            }),
+        );
         push(
             replacement,
             Instr::LocalGet(walrus::ir::LocalGet { local: addr_local }),
@@ -1000,36 +1379,65 @@ impl<'a> StoreRewriter<'a> {
         );
         push(
             replacement,
-            Instr::Const(walrus::ir::Const {
-                value: walrus::ir::Value::I32(size),
-            }),
-        );
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: old_local }),
-        );
-        push(
-            replacement,
-            Instr::Unop(walrus::ir::Unop {
-                op: UnaryOp::I64ExtendUI32,
-            }),
-        );
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: new_local }),
-        );
-        push(
-            replacement,
-            Instr::Unop(walrus::ir::Unop {
-                op: UnaryOp::I64ExtendUI32,
-            }),
-        );
-        push(
-            replacement,
             Instr::Call(walrus::ir::Call {
-                func: self.hook_ids.emit_write,
+                func: self.hook_ids.emit_i32,
             }),
         );
+    }
+
+    /// Slots 1 and 2 of a store group: the previous and the new value,
+    /// each widened into the `i64` slot the way the withdrawn write
+    /// hook did (zero-extend for narrower integers, bit-reinterpret
+    /// for floats so the receiver sees a stable bit pattern).
+    fn push_store_values(
+        &self,
+        replacement: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
+        push: &impl Fn(&mut Vec<(Instr, walrus::ir::InstrLocId)>, Instr),
+        old_local: LocalId,
+        new_local: LocalId,
+        widen: &[UnaryOp],
+    ) {
+        for (slot, local) in [(1i32, old_local), (2i32, new_local)] {
+            push(
+                replacement,
+                Instr::Const(walrus::ir::Const {
+                    value: walrus::ir::Value::I32(slot),
+                }),
+            );
+            push(replacement, Instr::LocalGet(walrus::ir::LocalGet { local }));
+            for op in widen {
+                push(replacement, Instr::Unop(walrus::ir::Unop { op: *op }));
+            }
+            push(
+                replacement,
+                Instr::Call(walrus::ir::Call {
+                    func: self.hook_ids.emit_i64,
+                }),
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_hook_write_i32(
+        &self,
+        replacement: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
+        push: &impl Fn(&mut Vec<(Instr, walrus::ir::InstrLocId)>, Instr),
+        offset_const: i32,
+        size: i32,
+        addr_local: LocalId,
+        old_local: LocalId,
+        new_local: LocalId,
+    ) {
+        self.push_store_group_open(replacement, push, size);
+        self.push_store_address(replacement, push, offset_const, addr_local);
+        self.push_store_values(
+            replacement,
+            push,
+            old_local,
+            new_local,
+            &[UnaryOp::I64ExtendUI32],
+        );
+        self.push_store_group_close(replacement, push, size);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1043,42 +1451,10 @@ impl<'a> StoreRewriter<'a> {
         old_local: LocalId,
         new_local: LocalId,
     ) {
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: addr_local }),
-        );
-        push(
-            replacement,
-            Instr::Const(walrus::ir::Const {
-                value: walrus::ir::Value::I32(offset_const),
-            }),
-        );
-        push(
-            replacement,
-            Instr::Binop(walrus::ir::Binop {
-                op: BinaryOp::I32Add,
-            }),
-        );
-        push(
-            replacement,
-            Instr::Const(walrus::ir::Const {
-                value: walrus::ir::Value::I32(size),
-            }),
-        );
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: old_local }),
-        );
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: new_local }),
-        );
-        push(
-            replacement,
-            Instr::Call(walrus::ir::Call {
-                func: self.hook_ids.emit_write,
-            }),
-        );
+        self.push_store_group_open(replacement, push, size);
+        self.push_store_address(replacement, push, offset_const, addr_local);
+        self.push_store_values(replacement, push, old_local, new_local, &[]);
+        self.push_store_group_close(replacement, push, size);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1092,67 +1468,17 @@ impl<'a> StoreRewriter<'a> {
         old_local: LocalId,
         new_local: LocalId,
     ) {
-        push(
+        self.push_store_group_open(replacement, push, size);
+        self.push_store_address(replacement, push, offset_const, addr_local);
+        // f32 -> i32 (reinterpret) -> i64 (zero-extend)
+        self.push_store_values(
             replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: addr_local }),
+            push,
+            old_local,
+            new_local,
+            &[UnaryOp::I32ReinterpretF32, UnaryOp::I64ExtendUI32],
         );
-        push(
-            replacement,
-            Instr::Const(walrus::ir::Const {
-                value: walrus::ir::Value::I32(offset_const),
-            }),
-        );
-        push(
-            replacement,
-            Instr::Binop(walrus::ir::Binop {
-                op: BinaryOp::I32Add,
-            }),
-        );
-        push(
-            replacement,
-            Instr::Const(walrus::ir::Const {
-                value: walrus::ir::Value::I32(size),
-            }),
-        );
-        // old: f32 -> i32 (reinterpret) -> i64 (zero-extend)
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: old_local }),
-        );
-        push(
-            replacement,
-            Instr::Unop(walrus::ir::Unop {
-                op: UnaryOp::I32ReinterpretF32,
-            }),
-        );
-        push(
-            replacement,
-            Instr::Unop(walrus::ir::Unop {
-                op: UnaryOp::I64ExtendUI32,
-            }),
-        );
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: new_local }),
-        );
-        push(
-            replacement,
-            Instr::Unop(walrus::ir::Unop {
-                op: UnaryOp::I32ReinterpretF32,
-            }),
-        );
-        push(
-            replacement,
-            Instr::Unop(walrus::ir::Unop {
-                op: UnaryOp::I64ExtendUI32,
-            }),
-        );
-        push(
-            replacement,
-            Instr::Call(walrus::ir::Call {
-                func: self.hook_ids.emit_write,
-            }),
-        );
+        self.push_store_group_close(replacement, push, size);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1166,54 +1492,16 @@ impl<'a> StoreRewriter<'a> {
         old_local: LocalId,
         new_local: LocalId,
     ) {
-        push(
+        self.push_store_group_open(replacement, push, size);
+        self.push_store_address(replacement, push, offset_const, addr_local);
+        self.push_store_values(
             replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: addr_local }),
+            push,
+            old_local,
+            new_local,
+            &[UnaryOp::I64ReinterpretF64],
         );
-        push(
-            replacement,
-            Instr::Const(walrus::ir::Const {
-                value: walrus::ir::Value::I32(offset_const),
-            }),
-        );
-        push(
-            replacement,
-            Instr::Binop(walrus::ir::Binop {
-                op: BinaryOp::I32Add,
-            }),
-        );
-        push(
-            replacement,
-            Instr::Const(walrus::ir::Const {
-                value: walrus::ir::Value::I32(size),
-            }),
-        );
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: old_local }),
-        );
-        push(
-            replacement,
-            Instr::Unop(walrus::ir::Unop {
-                op: UnaryOp::I64ReinterpretF64,
-            }),
-        );
-        push(
-            replacement,
-            Instr::LocalGet(walrus::ir::LocalGet { local: new_local }),
-        );
-        push(
-            replacement,
-            Instr::Unop(walrus::ir::Unop {
-                op: UnaryOp::I64ReinterpretF64,
-            }),
-        );
-        push(
-            replacement,
-            Instr::Call(walrus::ir::Call {
-                func: self.hook_ids.emit_write,
-            }),
-        );
+        self.push_store_group_close(replacement, push, size);
     }
 }
 
@@ -1250,6 +1538,7 @@ fn collect_block_ids(local_func: &walrus::LocalFunction, root: InstrSeqId) -> Ve
 struct ImportedCallRewriter<'a> {
     hook_ids: &'a HookFunctionIds,
     imported_funcs: &'a ImportedFuncSet,
+    scratch: Option<&'a ScratchPool>,
 }
 
 impl<'a> ImportedCallRewriter<'a> {
@@ -1266,13 +1555,15 @@ impl<'a> ImportedCallRewriter<'a> {
         for idx in (0..original_len).rev() {
             let (instr, loc) = local_func.block(id).instrs[idx].clone();
             if let Instr::Call(walrus::ir::Call { func }) = instr {
-                if let Some(import_index) = self.imported_funcs.index_of(func) {
-                    self.replace_imported_call(local_func, id, idx, func, import_index, loc);
+                if let Some((import_index, sig)) = self.imported_funcs.lookup(func) {
+                    let sig = sig.clone();
+                    self.replace_imported_call(local_func, id, idx, func, import_index, &sig, loc);
                 }
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replace_imported_call(
         &mut self,
         local_func: &mut walrus::LocalFunction,
@@ -1280,10 +1571,18 @@ impl<'a> ImportedCallRewriter<'a> {
         idx: usize,
         target: FunctionId,
         import_index: u32,
+        sig: &BoundarySignature,
         loc: walrus::ir::InstrLocId,
     ) {
         let mut replacement: Vec<(Instr, walrus::ir::InstrLocId)> = Vec::with_capacity(8);
-        // PRE: emit_call(0, import_index); realm_boundary(0, 0, import_index, token)
+        // PRE: emit_call(0, import_index); the argument tuple;
+        //      realm_boundary(0, 0, import_index, token).
+        //
+        // The arguments go *between* the call event and the realm
+        // marker so a host can split the flat value stream without
+        // the signature: everything between `__ct_emit_call` and the
+        // next non-value event is the argument tuple. See the framing
+        // contract in `hooks`.
         push_call_event(
             &mut replacement,
             loc,
@@ -1291,6 +1590,9 @@ impl<'a> ImportedCallRewriter<'a> {
             FUNC_KIND_IMPORT,
             import_index,
         );
+        if let Some(scratch) = self.scratch {
+            push_value_capture_group(&mut replacement, loc, self.hook_ids, scratch, &sig.params);
+        }
         push_realm_boundary(
             &mut replacement,
             loc,
@@ -1301,7 +1603,13 @@ impl<'a> ImportedCallRewriter<'a> {
         );
         // The original call.
         replacement.push((Instr::Call(walrus::ir::Call { func: target }), loc));
-        // POST: emit_return(0, import_index); realm_boundary(1, 0, import_index, token)
+        // POST: the result tuple — *the* non-determinism this whole
+        // design exists to capture, since replay feeds these back in
+        // place of calling the real host (spec §§ 3.2, 6) — then
+        // emit_return(0, import_index); realm_boundary(1, ...).
+        if let Some(scratch) = self.scratch {
+            push_value_capture_group(&mut replacement, loc, self.hook_ids, scratch, &sig.results);
+        }
         push_call_event(
             &mut replacement,
             loc,
@@ -1322,11 +1630,6 @@ impl<'a> ImportedCallRewriter<'a> {
         block.instrs.splice(idx..=idx, replacement);
     }
 }
-
-const FUNC_KIND_IMPORT: i32 = 0;
-const FUNC_KIND_EXPORT: i32 = 1;
-const REALM_DIRECTION_ENTER: i32 = 0;
-const REALM_DIRECTION_LEAVE: i32 = 1;
 
 fn push_call_event(
     replacement: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
@@ -1399,12 +1702,19 @@ fn wrap_local_function_boundary(
     target: FunctionId,
     export_index: u32,
     hooks: &HookFunctionIds,
+    sig: &BoundarySignature,
+    scratch: Option<&ScratchPool>,
 ) {
     let kind = match &mut module.funcs.get_mut(target).kind {
         FunctionKind::Local(lf) => lf,
         _ => return,
     };
     let entry_block_id = kind.entry_block();
+    // Parameters arrive as the function's leading locals, so the
+    // argument tuple needs no spill at all — it is already
+    // addressable, and reading it at entry (before any `local.set`
+    // can overwrite a parameter slot) reports what the caller passed.
+    let params: Vec<LocalId> = kind.args.clone();
 
     // Pre-build the entry prologue + exit epilogue as two
     // separate instruction sequences, then splice them in.
@@ -1419,6 +1729,11 @@ fn wrap_local_function_boundary(
         FUNC_KIND_EXPORT,
         export_index,
     );
+    if scratch.is_some() {
+        for (slot, (local, ty)) in params.iter().zip(sig.params.iter()).enumerate() {
+            push_value_emit(&mut prologue, zero_loc, hooks, slot as i32, *local, *ty);
+        }
+    }
     push_realm_boundary(
         &mut prologue,
         zero_loc,
@@ -1428,6 +1743,9 @@ fn wrap_local_function_boundary(
         export_index,
     );
 
+    if let Some(scratch) = scratch {
+        push_value_capture_group(&mut epilogue, zero_loc, hooks, scratch, &sig.results);
+    }
     push_call_event(
         &mut epilogue,
         zero_loc,
@@ -1450,7 +1768,7 @@ fn wrap_local_function_boundary(
 
     // Also wrap any explicit `return` instructions that appear
     // inside any block of this function.
-    wrap_returns_in_function(module, target, export_index, hooks);
+    wrap_returns_in_function(module, target, export_index, hooks, sig, scratch);
 }
 
 fn wrap_returns_in_function(
@@ -1458,6 +1776,8 @@ fn wrap_returns_in_function(
     target: FunctionId,
     export_index: u32,
     hooks: &HookFunctionIds,
+    sig: &BoundarySignature,
+    scratch: Option<&ScratchPool>,
 ) {
     let kind = match &mut module.funcs.get_mut(target).kind {
         FunctionKind::Local(lf) => lf,
@@ -1472,6 +1792,12 @@ fn wrap_returns_in_function(
             if matches!(block.instrs[idx].0, Instr::Return(_)) {
                 let loc = block.instrs[idx].1;
                 let mut prefix: Vec<(Instr, walrus::ir::InstrLocId)> = Vec::new();
+                // An explicit `return` has the function's results on
+                // top of the stack, exactly as the fall-through exit
+                // does, so the same spill/restore applies.
+                if let Some(scratch) = scratch {
+                    push_value_capture_group(&mut prefix, loc, hooks, scratch, &sig.results);
+                }
                 push_call_event(
                     &mut prefix,
                     loc,
@@ -1507,8 +1833,22 @@ mod tests {
         let out = Pipeline::new().run_bytes(&input).unwrap();
         // Re-parse the output to confirm structural validity.
         let module = Module::from_buffer(&out).unwrap();
-        // Five imports (the five __ct_emit_* hooks).
-        assert_eq!(module.imports.iter().count(), 5);
+        // The hook surface has a size, stated here as a literal rather
+        // than as `ALL_HOOKS.len()`. Comparing the emitted imports
+        // against `ALL_HOOKS` alone would be satisfied by a surface
+        // that lost a hook in both places at once; this line is what
+        // makes dropping one a test failure.
+        assert_eq!(
+            hooks::ALL_HOOKS.len(),
+            8,
+            "the hook surface changed size — spec § 5 lists exactly four \
+             control hooks, the token source, and one value hook per WASM \
+             scalar type"
+        );
+        // One import per declared hook, and nothing else.
+        assert_eq!(module.imports.iter().count(), hooks::ALL_HOOKS.len());
+        let declared: Vec<&str> = module.imports.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(declared, hooks::ALL_HOOKS);
         // The custom marker section is present.
         assert!(module
             .customs
@@ -1516,8 +1856,16 @@ mod tests {
             .any(|(_, c)| c.name() == hooks::CUSTOM_SECTION_NAME));
     }
 
-    /// A module that performs one `i32.store` gets one
-    /// `__ct_emit_write` injected.
+    /// A module that performs one `i32.store` gets exactly one store
+    /// event group injected — one group header, and a group carrying
+    /// the full `(addr, old, new)` tuple.
+    ///
+    /// The withdrawn write hook carried those three fields as its own
+    /// arguments, so counting hook calls was enough to prove the record
+    /// was complete. Now the fields arrive as separate value hooks, so
+    /// the count of headers alone would pass for a group that reported
+    /// an address and nothing else; the tuple is checked explicitly
+    /// below to keep the assertion as strong as the one it replaced.
     #[test]
     fn single_i32_store_instrumented_once() {
         let wat = r#"
@@ -1532,33 +1880,112 @@ mod tests {
         let out = Pipeline::new().run_bytes(&input).unwrap();
         let module = Module::from_buffer(&out).unwrap();
 
-        // Count `Call` instructions targeting the __ct_emit_write hook.
-        let write_id = module
+        // A store now reports through the group header
+        // `__ct_emit_call(FUNC_KIND_STORE, size)` rather than a
+        // dedicated write hook, so count those headers.
+        let call_id = module
             .imports
             .iter()
-            .find(|i| i.name == hooks::HOOK_WRITE)
+            .find(|i| i.name == hooks::HOOK_CALL)
             .and_then(|i| match i.kind {
                 walrus::ImportKind::Function(f) => Some(f),
                 _ => None,
             })
             .expect("hook import missing");
 
-        let mut write_calls = 0u32;
+        let return_id = module
+            .imports
+            .iter()
+            .find(|i| i.name == hooks::HOOK_RETURN)
+            .and_then(|i| match i.kind {
+                walrus::ImportKind::Function(f) => Some(f),
+                _ => None,
+            })
+            .expect("hook import missing");
+        let value_hooks: Vec<FunctionId> = module
+            .imports
+            .iter()
+            .filter(|i| {
+                [
+                    hooks::HOOK_EMIT_I32,
+                    hooks::HOOK_EMIT_I64,
+                    hooks::HOOK_EMIT_F32,
+                    hooks::HOOK_EMIT_F64,
+                ]
+                .contains(&i.name.as_str())
+            })
+            .filter_map(|i| match i.kind {
+                walrus::ImportKind::Function(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+
+        let mut store_groups = 0u32;
+        let mut tuple_widths: Vec<usize> = Vec::new();
         for (_, lf) in module.funcs.iter_local() {
             let entry = lf.entry_block();
             for bid in collect_block_ids(lf, entry) {
-                for (instr, _) in &lf.block(bid).instrs {
+                let instrs = &lf.block(bid).instrs;
+                for (i, (instr, _)) in instrs.iter().enumerate() {
                     if let Instr::Call(walrus::ir::Call { func }) = instr {
-                        if *func == write_id {
-                            write_calls += 1;
+                        if *func == call_id
+                            && preceding_const_i32(instrs, i, 1) == Some(FUNC_KIND_STORE)
+                        {
+                            store_groups += 1;
+                            // Count the value hooks between this header
+                            // and the group's closing marker.
+                            let mut width = 0usize;
+                            for (later, _) in instrs.iter().skip(i + 1) {
+                                match later {
+                                    Instr::Call(walrus::ir::Call { func: f })
+                                        if *f == return_id =>
+                                    {
+                                        break
+                                    }
+                                    Instr::Call(walrus::ir::Call { func: f })
+                                        if value_hooks.contains(f) =>
+                                    {
+                                        width += 1
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            tuple_widths.push(width);
                         }
                     }
                 }
             }
         }
         assert_eq!(
-            write_calls, 1,
-            "expected exactly one __ct_emit_write per store"
+            store_groups, 1,
+            "expected exactly one store event group per store"
         );
+        assert_eq!(
+            tuple_widths,
+            vec![3],
+            "a store group must carry the full (addr, old, new) tuple, \
+             which is what the withdrawn write hook reported in one call"
+        );
+    }
+
+    /// The `n`-th `i32.const` preceding `at`, scanning backwards.
+    fn preceding_const_i32(
+        instrs: &[(Instr, walrus::ir::InstrLocId)],
+        at: usize,
+        n: usize,
+    ) -> Option<i32> {
+        let mut seen = 0;
+        for j in (0..at).rev() {
+            if let Instr::Const(walrus::ir::Const {
+                value: walrus::ir::Value::I32(v),
+            }) = &instrs[j].0
+            {
+                if seen == n {
+                    return Some(*v);
+                }
+                seen += 1;
+            }
+        }
+        None
     }
 }

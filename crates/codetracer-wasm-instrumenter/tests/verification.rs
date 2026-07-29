@@ -2,7 +2,7 @@
 //!
 //! - `test_wasm_recorder_runtime_emits_store_events` — a module
 //!   executing a known sequence of `i32.store` instructions emits
-//!   one `__ct_emit_write` call per store.
+//!   one store event per store.
 //! - `test_wasm_recorder_runtime_emits_realm_crossing_events` —
 //!   every JS↔WASM call site produces a recorded boundary event
 //!   with a correlation token.
@@ -63,7 +63,7 @@ fn test_wasm_recorder_runtime_emits_store_events() {
     assert_eq!(
         writes.len(),
         4,
-        "expected one __ct_emit_write per store; saw {:?}",
+        "expected one store event per store; saw {:?}",
         writes
     );
     for w in writes {

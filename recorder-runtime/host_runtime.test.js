@@ -236,3 +236,49 @@ test("createRecorderRuntime keeps the onBatch path working alongside producer", 
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0], { kind: "WasmCall", fn_kind: 0, fn_index: 5 });
 });
+
+test("typed value hooks record exact bit patterns", () => {
+  const events = [];
+  const r = createRecorderRuntime({
+    producer: {
+      send(e) {
+        events.push(e);
+      },
+      flush() {},
+      close() {},
+    },
+  });
+  r.imports.__ct_emit_i32(0, -1);
+  r.imports.__ct_emit_i64(1, 0x0123456789abcdefn);
+  r.imports.__ct_emit_f32(2, 1.5);
+  // Negative zero is the case a naive `Number` comparison cannot see:
+  // `-0 === 0`, and only the sign bit tells them apart.
+  r.imports.__ct_emit_f64(3, -0);
+  r.flush();
+
+  assert.deepEqual(events, [
+    { kind: "WasmValue", slot: 0, valueType: "i32", bits: "4294967295" },
+    { kind: "WasmValue", slot: 1, valueType: "i64", bits: "81985529216486895" },
+    { kind: "WasmValue", slot: 2, valueType: "f32", bits: "1069547520" },
+    {
+      kind: "WasmValue",
+      slot: 3,
+      valueType: "f64",
+      bits: "9223372036854775808",
+    },
+  ]);
+});
+
+test("decodeSlot round-trips a boundary value slot", () => {
+  const view = new DataView(new ArrayBuffer(32));
+  view.setUint8(0, 5);
+  view.setUint8(1, 3); // f64
+  view.setUint32(4, 6, true); // slot
+  view.setBigUint64(16, 0x4008000000000000n, true); // 3.0
+  assert.deepEqual(decodeSlot(view, 0), {
+    kind: "WasmValue",
+    slot: 6,
+    valueType: "f64",
+    bits: "4613937818241073152",
+  });
+});

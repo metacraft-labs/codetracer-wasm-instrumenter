@@ -27,8 +27,8 @@ build-wasm-target-check:
 test: test-rust
 
 # Whole-workspace cargo test run (unit tests + the `verification`,
-# `parity`, `cli_smoke`, `factory_logs_all_calls` and `stylus_parity`
-# integration suites).
+# `parity`, `cli_smoke`, `boundary_values`, `boundary_decode`,
+# `factory_logs_all_calls` and `stylus_parity` integration suites).
 test-rust:
     cargo test --workspace --locked
 
@@ -37,6 +37,13 @@ test-rust:
 # because they only shell out to the CLI built by `build-rust`.
 test-plugins:
     for p in plugins/*/; do (cd "$p" && node --test index.test.js); done
+
+# The browser-side runtime shims under `recorder-runtime/` are plain ESM
+# modules, likewise tested with node's built-in runner.  Kept out of
+# `test` for the same reason as `test-plugins`: `test` is the cargo
+# graph `repro test` mirrors one-for-one.
+test-runtime:
+    cd recorder-runtime && node --test host_runtime.test.js browser_session.test.js
 
 # --- Lint -------------------------------------------------------------
 

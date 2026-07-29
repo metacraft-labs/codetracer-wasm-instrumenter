@@ -73,11 +73,14 @@ fn test_wasm_instrumenter_cli_produces_valid_module() {
         }
     }
     for expected in [
-        "__ct_emit_write",
         "__ct_emit_call",
         "__ct_emit_return",
         "__ct_emit_realm_boundary",
         "__ct_correlation_token",
+        "__ct_emit_i32",
+        "__ct_emit_i64",
+        "__ct_emit_f32",
+        "__ct_emit_f64",
     ] {
         assert!(
             hooks_seen.contains(expected),

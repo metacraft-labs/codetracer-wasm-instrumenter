@@ -9,6 +9,10 @@ description = "Bytecode-rewriting WASM instrumentation pipeline for CodeTracer (
 
 [dependencies]
 walrus      = { workspace = true }
+# Reading `.debug_line` so recorded WASM frames carry real source
+# locations. Already in the graph as a walrus dependency, so this adds
+# no new third-party code — only a direct edge to it.
+gimli       = "0.32"
 wasmparser  = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
@@ -19,4 +23,8 @@ toml        = { workspace = true }
 [dev-dependencies]
 wat         = { workspace = true }
 wasmprinter = { workspace = true }
+# A real engine, so the M35 boundary-value tests assert on values that
+# actually crossed the boundary rather than on instructions that would
+# have carried them.
+wasmi       = { workspace = true }
 codetracer-wasm-stub-host = { path = "../codetracer-wasm-stub-host" }

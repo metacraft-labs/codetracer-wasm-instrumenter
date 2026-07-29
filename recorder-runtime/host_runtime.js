@@ -219,18 +219,40 @@ export function createWebSocketProducer(options = {}) {
  * Event layout in the batch buffer (little-endian, all fields
  * naturally aligned):
  *
- *   - u8  tag      (1 = write, 2 = call, 3 = return, 4 = realm_boundary)
- *   - u8  fn_kind  (write: padding 0; call/return: 0|1; realm: 0|1)
+ *   - u8  tag      (1 = write, 2 = call, 3 = return, 4 = realm_boundary,
+ *                   5 = boundary value)
+ *   - u8  fn_kind  (write: padding 0; call/return: 0|1|2; realm: 0|1;
+ *                   value: the value's type, 0=i32 1=i64 2=f32 3=f64)
  *   - u8  direction (realm only: 0|1; padding 0 otherwise)
  *   - u8  reserved
- *   - u32 fn_index (call/return/realm); padding 0 for write
+ *   - u32 fn_index (call/return/realm); slot index for a value;
+ *                   padding 0 for write
  *   - u32 size   (write only); padding 0 otherwise
  *   - u32 addr   (write only); padding 0 otherwise
- *   - u64 old / token (write: old; realm: token; padding 0 otherwise)
+ *   - u64 old / token / bits (write: old; realm: token; value: the
+ *                   value's raw bit pattern; padding 0 otherwise)
  *   - u64 new    (write only); padding 0 otherwise
  *
  * Total: 32 bytes per event. The receiver demarshals using the
  * tag byte.
+ *
+ * Boundary values carry raw *bit patterns* rather than numbers: spec
+ * § 7 makes a NaN payload mismatch a replay divergence, so a float
+ * that round-tripped through a JS number would be a recording the
+ * replayer must reject.
+ *
+ * Known limit of a *JavaScript* host: WASM hands `f32` and `f64` to JS
+ * as a `Number`, and the WebAssembly JS API leaves NaN payloads
+ * implementation-defined across that conversion. So the bits recorded
+ * here are exact for every finite value, for infinities and for
+ * negative zero, but a signalling-NaN payload may already have been
+ * canonicalised before this function sees it. That is a property of
+ * the JS boundary, not of the instrumentation — a host that reads the
+ * values without going through a `Number` (the wazero replayer, or the
+ * `wasmi`-based test harness in `codetracer-wasm-stub-host`) sees them
+ * bit-exact. A recording made in a browser from a module that computes
+ * with NaN payloads is therefore not replay-safe under § 7, and the
+ * replayer's divergence check is what will say so.
  *
  * When a `producer` (or `endpoint`) is supplied, the runtime
  * also translates each event into its JSON shape and ships it
@@ -297,8 +319,55 @@ export function createRecorderRuntime(options = {}) {
     }
   }
 
+  /**
+   * Append one boundary-value slot.
+   *
+   * @param {number} typeTag 0=i32, 1=i64, 2=f32, 3=f64.
+   * @param {number} slot Position within the argument or result tuple.
+   * @param {bigint} bits Raw bit pattern of the value.
+   */
+  function recordValue(typeTag, slot, bits) {
+    reserve();
+    view.setUint8(cursor, 5);
+    view.setUint8(cursor + 1, typeTag);
+    view.setUint8(cursor + 2, 0);
+    view.setUint8(cursor + 3, 0);
+    view.setUint32(cursor + 4, slot >>> 0, true);
+    view.setUint32(cursor + 8, 0, true);
+    view.setUint32(cursor + 12, 0, true);
+    view.setBigUint64(cursor + 16, bits, true);
+    view.setBigUint64(cursor + 24, 0n, true);
+    cursor += eventSize;
+  }
+
   return {
     imports: {
+      /**
+       * Boundary value hooks (spec § 5). One per WASM value type,
+       * because a single hook would have to widen `f32`, which is not
+       * bit-preserving for signalling NaNs.
+       */
+      __ct_emit_i32(slot, value) {
+        recordValue(0, slot, BigInt(value >>> 0));
+      },
+      __ct_emit_i64(slot, value) {
+        recordValue(1, slot, asBigInt(value));
+      },
+      __ct_emit_f32(slot, value) {
+        recordValue(2, slot, BigInt(f32Bits(value)));
+      },
+      __ct_emit_f64(slot, value) {
+        recordValue(3, slot, f64Bits(value));
+      },
+
+      /**
+       * Legacy per-store write hook.
+       *
+       * Nothing this pipeline emits calls it — spec § 5 withdrew it
+       * from the hook surface. It stays here so a module produced by
+       * an older instrumenter, which still declares the import,
+       * remains instantiable against this runtime.
+       */
       __ct_emit_write(addr, size, oldLo, newLo) {
         // The WASM ABI hands i64 args back as BigInt in modern
         // Node / browsers when WebAssembly.BigInt is enabled.
@@ -436,6 +505,16 @@ export function decodeSlot(view, off) {
       return { kind: "WasmCall", fn_kind: fnKind, fn_index: fnIndex };
     case 3:
       return { kind: "WasmReturn", fn_kind: fnKind, fn_index: fnIndex };
+    case 5:
+      return {
+        kind: "WasmValue",
+        slot: fnIndex,
+        valueType: ["i32", "i64", "f32", "f64"][fnKind] ?? "unknown",
+        // A decimal string, like the other 64-bit fields: JSON numbers
+        // are doubles and would lose the high bits of an i64 and the
+        // payload of a NaN alike.
+        bits: oldOrToken.toString(),
+      };
     case 4:
       // Per `wasm_realm_marker_payload` (correlation_markers.rs):
       // token is the M25 pair-index key, rendered as a decimal
@@ -458,4 +537,28 @@ function asBigInt(v) {
   if (typeof v === "bigint") return v;
   if (typeof v === "number") return BigInt(v >>> 0);
   return 0n;
+}
+
+// Scratch buffers for reading a float's raw bits. Module-level so the
+// hot value hooks allocate nothing.
+const floatScratch = new DataView(new ArrayBuffer(8));
+
+/**
+ * IEEE-754 bit pattern of an `f32`, as an unsigned 32-bit number.
+ * @param {number} v
+ * @returns {number}
+ */
+function f32Bits(v) {
+  floatScratch.setFloat32(0, v, true);
+  return floatScratch.getUint32(0, true);
+}
+
+/**
+ * IEEE-754 bit pattern of an `f64`, as an unsigned BigInt.
+ * @param {number} v
+ * @returns {bigint}
+ */
+function f64Bits(v) {
+  floatScratch.setFloat64(0, v, true);
+  return floatScratch.getBigUint64(0, true);
 }

@@ -36,8 +36,9 @@ yourself needing a tool that is not in `flake.nix`, add it to `flake.nix`.
 | Command                        | What it does                                                     |
 | ------------------------------ | ---------------------------------------------------------------- |
 | `just build`                   | `cargo build --workspace --release --locked`                     |
-| `just test`                    | `cargo test --workspace --locked` — the whole suite (27 tests)    |
+| `just test`                    | `cargo test --workspace --locked` — the whole suite (53 tests)    |
 | `just test-plugins`            | `node --test` over the bundler plugin wrappers in `plugins/`      |
+| `just test-runtime`            | `node --test` over the shims in `recorder-runtime/`               |
 | `just lint`                    | `cargo clippy … -D warnings`, `cargo fmt --check`, `nixfmt --check` |
 | `just format` (alias `fmt`)    | `cargo fmt --all` + `nixfmt`                                     |
 | `just build-wasm-target-check` | Prove the shell really carries `wasm32-unknown-unknown` rust-std  |
@@ -56,12 +57,21 @@ equivalence).
   - `dwarf.rs` — DWARF line-table / declaration recovery for source
     attribution.
   - `manifest.rs` — the sidecar `ModuleManifest` (`paths` / `functions` /
-    `sites`), deliberately identical in shape to the JS instrumenter's
-    manifest so both are consumed by one decoder in
-    `codetracer/src/backend-manager/src/browser_stream_host.rs`.
+    `sites` / `boundaries`), deliberately identical in shape to the JS
+    instrumenter's manifest so both are consumed by one decoder in
+    `codetracer/src/backend-manager/src/browser_stream_host.rs`. The
+    `boundaries` table is the M35 addition: each import/export edge's
+    parameter and result types, so the replayer can decode the flat
+    `__ct_emit_<t>(slot, value)` stream without re-parsing the `.wasm`.
   - `config.rs` — instrumentation configuration.
 - `crates/codetracer-wasm-stub-host/` — a minimal walrus-based interpreter that
   consumes instrumented modules; drives the parity test.
+  - `runtime.rs` — a *real* embedder (`wasmi`) that executes a module and
+    records the values its hooks carried. Boundary-value behaviour can only
+    be checked by running: a static walk sees `local.get 0`, never the
+    number it pushed. The same entry point runs the un-instrumented module,
+    which is how "instrumented computes identically to original" is
+    asserted rather than assumed.
 - `crates/codetracer-wasm-host-module-framework/` — pluggable pass-through
   host-module factory (replaces hard-coded Stylus stubs).
 - `crates/ct-instrument-cli/` — the thin `ct instrument` CLI (`ct-instrument`

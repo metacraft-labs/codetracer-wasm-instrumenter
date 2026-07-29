@@ -23,6 +23,23 @@ pub struct PipelineConfig {
 
     /// Whether to wrap entry/exit of exported functions.
     pub instrument_exported_functions: bool,
+
+    /// Whether the boundary passes also capture the *values* that
+    /// cross the boundary — every argument and every result, through
+    /// the typed `__ct_emit_{i32,i64,f32,f64}` hooks.
+    ///
+    /// On by default, because a boundary log without values is not a
+    /// re-execution input: the replayer cannot supply an import's
+    /// return value it was never told (spec §§ 3.2, 6). The flag
+    /// exists so a consumer that only wants the call *shape* (the
+    /// M27 V1 event vocabulary) can ask for it, and so the two
+    /// halves can be tested independently.
+    #[serde(default = "default_capture_boundary_values")]
+    pub capture_boundary_values: bool,
+}
+
+fn default_capture_boundary_values() -> bool {
+    true
 }
 
 impl Default for PipelineConfig {
@@ -32,6 +49,7 @@ impl Default for PipelineConfig {
             instrument_stores: true,
             instrument_imported_calls: true,
             instrument_exported_functions: true,
+            capture_boundary_values: true,
         }
     }
 }
@@ -44,6 +62,7 @@ impl PipelineConfig {
             instrument_stores: false,
             instrument_imported_calls: false,
             instrument_exported_functions: false,
+            capture_boundary_values: false,
         }
     }
 

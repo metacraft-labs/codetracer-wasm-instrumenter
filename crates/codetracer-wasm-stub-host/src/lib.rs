@@ -8,6 +8,13 @@
 //!    embedder *would* have observed at runtime. The resulting
 //!    [`Event`] vector is the synthetic CTFS event stream.
 //!
+//! 1b. [`runtime::run_module`]: actually *executes* a module under
+//!    `wasmi`, which is the only way to observe the boundary
+//!    **values** M35 captures — a static walk sees `local.get 0`,
+//!    not the number it pushed. The same entry point runs the
+//!    un-instrumented module, so a test can assert the two computed
+//!    the same thing.
+//!
 //! 2. [`record_interpreter`]: walks the *original* (un-instrumented)
 //!    module and synthesises the event stream that the existing
 //!    interpreter-based recorders (`codetracer-wasm-recorder/`,
@@ -31,7 +38,14 @@ use serde::{Deserialize, Serialize};
 use walrus::ir::{Instr, InstrSeqId};
 use walrus::{FunctionId, Module};
 
-/// One observable CodeTracer event. Mirrors the four `__ct_emit_*`
+pub mod runtime;
+
+pub use runtime::{
+    boundary_frames, frames_for, run_module, BoundaryFrame, ImportStub, RecordedValue,
+    RuntimeEvent, RuntimeRecording,
+};
+
+/// One observable CodeTracer event. Mirrors the `__ct_emit_*`
 /// signatures plus the realm-boundary correlation token.
 ///
 /// The variants intentionally drop runtime-only fields like
@@ -40,7 +54,10 @@ use walrus::{FunctionId, Module};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
-    /// `__ct_emit_write` — one per store.
+    /// One per store, from the experimental interior pass. Recognised
+    /// by its `hooks::FUNC_KIND_STORE` group header rather than by a
+    /// dedicated hook — the V1 per-store write hook is gone from the
+    /// surface (spec § 5).
     Write {
         /// Containing function (by index).
         function: u32,
@@ -195,7 +212,6 @@ pub fn assert_parity(left: &[Event], right: &[Event]) -> Result<()> {
 
 #[derive(Debug, Clone, Copy)]
 struct HookIds {
-    write: FunctionId,
     call: FunctionId,
     ret: FunctionId,
     realm: FunctionId,
@@ -218,7 +234,6 @@ impl HookIds {
                 .ok_or_else(|| anyhow!("instrumented module missing hook import: {name}"))
         };
         Ok(HookIds {
-            write: lookup(hooks::HOOK_WRITE)?,
             call: lookup(hooks::HOOK_CALL)?,
             ret: lookup(hooks::HOOK_RETURN)?,
             realm: lookup(hooks::HOOK_REALM_BOUNDARY)?,
@@ -251,25 +266,33 @@ fn walk_block_instrumented(
     let instrs = &lf.block(block_id).instrs;
     for (i, (instr, _)) in instrs.iter().enumerate() {
         if let Instr::Call(walrus::ir::Call { func }) = instr {
-            if *func == hook_ids.write {
-                // Layout (i32 store, common case):
-                //   local.get addr; i32.const offset;
-                //   i32.add; i32.const size; local.get old (i32);
-                //   i64.extend_i32_u; local.get new (i32);
-                //   i64.extend_i32_u; call __ct_emit_write.
-                // The most recent i32.const preceding the call is
-                // `size`; the one before that is `offset`. We
-                // only need `size` for the parity check.
-                let size = read_back_const_i32(instrs, i, 0).unwrap_or(0) as u32;
-                events.push(Event::Write { function, size });
-            } else if *func == hook_ids.call {
+            if *func == hook_ids.call {
+                // Layout: i32.const fn_kind; i32.const fn_index;
+                // call __ct_emit_call.
                 let fn_index = read_back_const_i32(instrs, i, 0).unwrap_or(0) as u32;
                 let fn_kind = read_back_const_i32(instrs, i, 1).unwrap_or(0);
-                events.push(Event::Call { fn_kind, fn_index });
+                if fn_kind == hooks::FUNC_KIND_STORE {
+                    // A store group: the header's `fn_index` field
+                    // carries the store's byte width, and the three
+                    // value hooks that follow carry (addr, old, new).
+                    // One `Write` per group keeps this vocabulary
+                    // identical to the V1 one the oracle synthesises.
+                    events.push(Event::Write {
+                        function,
+                        size: fn_index,
+                    });
+                } else {
+                    events.push(Event::Call { fn_kind, fn_index });
+                }
             } else if *func == hook_ids.ret {
                 let fn_index = read_back_const_i32(instrs, i, 0).unwrap_or(0) as u32;
                 let fn_kind = read_back_const_i32(instrs, i, 1).unwrap_or(0);
-                events.push(Event::Return { fn_kind, fn_index });
+                // The store group's closing marker is framing, not a
+                // second event — `Write` was already recorded when the
+                // group opened.
+                if fn_kind != hooks::FUNC_KIND_STORE {
+                    events.push(Event::Return { fn_kind, fn_index });
+                }
             } else if *func == hook_ids.realm {
                 // Layout: i32.const direction; i32.const fn_kind;
                 // i32.const fn_index; call __ct_correlation_token;
