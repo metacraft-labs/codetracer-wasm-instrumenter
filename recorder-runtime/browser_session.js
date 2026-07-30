@@ -345,8 +345,9 @@ export function createBrowserWasmRecorder(options = {}) {
   let unrepresentableHostWrites = 0;
   /**
    * Imported calls during which the host wrote, but whose crossing the
-   * recording does not carry (a `() -> ()` import leaves no value run,
-   * so the replayer recovers no crossing to anchor a mutation to).
+   * recording does not carry, because the call emitted no realm-boundary
+   * `ENTER` marker (see `sendHostMutation`). An empty `() -> ()`
+   * signature used to land here; as of M39 it does not.
    */
   let unanchorableHostWrites = 0;
   /**
@@ -371,14 +372,27 @@ export function createBrowserWasmRecorder(options = {}) {
   // than by inventing one:
   //
   //   * `internal/boundarylog/assembler.go` appends an export crossing
-  //     when the `Call` record arrives, and an import crossing when that
-  //     import's value run *closes*. `Seq` is the append order.
+  //     when the `Call` record arrives, and an import crossing when the
+  //     import's own `ENTER` realm marker arrives. `Seq` is the append
+  //     order.
   //   * This runtime emits the `Call` record in `__ct_emit_call`, after
-  //     flushing whatever run was pending — so a pending import run is
-  //     numbered before the export, exactly as over there.
-  //   * An import's argument run is flushed at its realm marker, before
-  //     the host call; its result run at `__ct_emit_return`. An import
-  //     with neither contributes no crossing at all, on both sides.
+  //     flushing whatever run was pending — so an import opened earlier
+  //     is numbered before the export, exactly as over there.
+  //   * An import's argument run is flushed *inside* the `ENTER` marker
+  //     hook, immediately before the marker record. The consumer sees
+  //     the run first and opens the crossing on it, then adopts it at
+  //     the marker; either way the crossing is appended at the marker's
+  //     position in the stream, so predicting it here needs nothing but
+  //     the marker.
+  //
+  // Before M39 the prediction had to mirror the consumer's value-run
+  // bracketing instead, because an import's markers could not be told
+  // from an export's and so could not delimit anything. It also meant
+  // an import with an empty `() -> ()` signature was numbered on
+  // NEITHER side — the crossing did not exist for the consumer, which
+  // is why a host write made while servicing one had nothing to anchor
+  // to and was refused (see `sendHostMutation`). Now that the edges are
+  // spelled apart, every import crossing has a number here and there.
   //
   // The prediction is not left to inspection: the fixture in
   // `codetracer/src/db-backend/tests/fixtures/wasm-memory-calldata/`
@@ -389,14 +403,8 @@ export function createBrowserWasmRecorder(options = {}) {
   /** Next `Crossing.Seq` the consumer will assign. */
   let nextCrossingSeq = 0;
   /**
-   * The import crossing the consumer currently holds open, if any.
-   * Mirrors `assembler.stack`'s import entries.
-   * @type {{label: string, seq: number}|null}
-   */
-  let openImportCrossing = null;
-  /**
    * Seq of the crossing the imported call in flight will be recovered
-   * as, or null while that is not yet decided (or never will be).
+   * as, or null while no imported call is open.
    * @type {number|null}
    */
   let inFlightImportSeq = null;
@@ -664,21 +672,35 @@ export function createBrowserWasmRecorder(options = {}) {
     const { memoryWrites, globalSets } = closeHostStateWindow();
     if (memoryWrites.length === 0 && globalSets.length === 0) return;
     if (inFlightImportSeq === null) {
-      // The import contributed no boundary values, so the recording
-      // carries no crossing for it and there is nothing to anchor to.
-      // (The realm markers are on disk, but they use the same label
-      // template for both edges, so the consumer cannot attribute them
-      // to an import — see `recording.go`'s "How a crossing appears in a
-      // browser `.ct`".) Say so rather than dropping the write.
+      // No crossing was opened for this imported call, so there is
+      // nothing §3.4 can anchor the write to.
+      //
+      // Before M39 this was the ordinary fate of an import whose
+      // signature is `() -> ()`: it contributed no boundary values, and
+      // its realm markers used the same label template as an export's,
+      // so the consumer recovered no crossing from them. That is fixed —
+      // the `ENTER` marker now names the import edge and assigns the
+      // crossing's `Seq` (see `__ct_emit_realm_boundary`), so an empty
+      // signature is no longer a reason to refuse.
+      //
+      // What is left is a genuine malformation: an imported call whose
+      // `ENTER` realm marker never fired. Every edge `ct-instrument`
+      // rewrites carries one (`replace_imported_call` pushes it between
+      // the argument tuple and the call), so reaching here means the
+      // module was instrumented by something else, or the host is
+      // driving the hooks by hand and out of order. Refusing loudly at
+      // the cause is the spec §8 discipline; silently dropping the write
+      // would surface as a divergence somewhere unrelated.
       unanchorableHostWrites += memoryWrites.length + globalSets.length;
       // eslint-disable-next-line no-console
       console.error(
         `[codetracer] the host wrote to imported state while servicing ` +
-          `import #${fnIndex}, but that import's signature carries no ` +
-          "boundary values, so the recording holds no crossing to anchor " +
-          "the write to (spec §3.4 anchors a mutation to the crossing it " +
-          "accompanied). The replay will not see it and will diverge. " +
-          "Give the import at least one argument or result.",
+          `import #${fnIndex}, but no realm-boundary ENTER marker was ` +
+          "emitted for that call, so the recording holds no crossing to " +
+          "anchor the write to (spec §3.4 anchors a mutation to the " +
+          "crossing it accompanied). The replay will not see it and will " +
+          "diverge. Instrument the module with `ct-instrument`, which " +
+          "wraps every import edge in the paired markers.",
       );
       return;
     }
@@ -723,10 +745,11 @@ export function createBrowserWasmRecorder(options = {}) {
    * Emit the paired markers for one realm crossing.
    *
    * @param {number} direction `REALM_DIRECTION_ENTER` or `..._LEAVE`.
+   * @param {number} fnKind `FUNC_KIND_EXPORT` or `FUNC_KIND_IMPORT`.
    * @param {bigint|number} token Shared correlation key.
-   * @param {number} fnIndex Export index, for the human-readable label.
+   * @param {number} fnIndex Export or import index, per `fnKind`.
    */
-  function emitRealmBoundary(direction, token, fnIndex) {
+  function emitRealmBoundary(direction, fnKind, token, fnIndex) {
     // The pair index matches on string equality of the key, so both
     // sides must stringify identically. BigInt tokens render without a
     // suffix, which is what the db-backend's decimal-string convention
@@ -736,7 +759,25 @@ export function createBrowserWasmRecorder(options = {}) {
     // Value flows WASM -> JS when leaving, JS -> WASM when entering.
     const wasmDirection = leaving ? "send" : "recv";
     const jsDirection = leaving ? "recv" : "send";
-    const label = `wasm export #${fnIndex}`;
+    const isImport = fnKind === FUNC_KIND_IMPORT;
+    // The two edges are spelled apart (M39). Until M39 both said
+    // `wasm export #<n>`, which made an import crossing's markers
+    // indistinguishable from an export's by their own content — and
+    // that mattered far beyond the label, because an import whose
+    // signature is `() -> ()` emits no `Call`/`Return` record and no
+    // boundary value either. Its markers are the ONLY trace it leaves,
+    // so an ambiguous label meant the crossing reached disk but could
+    // not be attributed, and `codetracer-wasm-recorder` replayed such a
+    // call unchecked (spec §§ 3.2, 6, 8).
+    //
+    // The index is the import index for an import edge and the export
+    // index for an export edge — the same numbering
+    // `boundaryBindingName`'s `import #<n>` label and the sidecar
+    // manifest's `boundaries` table use, which is what lets the
+    // consumer match a marker to a module import.
+    const label = isImport
+      ? `wasm import #${fnIndex}`
+      : `wasm export #${fnIndex}`;
 
     // Name the crossing binding only on the side that *sends* the
     // value: that is the side a chain resumes its walk on. Naming the
@@ -758,8 +799,17 @@ export function createBrowserWasmRecorder(options = {}) {
     // correct: a `-> ()` export sent no value, and pointing the walk
     // at a binding that does not exist would make an empty
     // continuation look like a failed lookup.
-    const returnValueName =
-      returnValueNames[exportName(fnIndex)] ?? lastResultBinding.get(fnIndex);
+    //
+    // Only an EXPORT edge gets one. Both lookups are keyed by the
+    // export index, and an import index is drawn from a different
+    // numbering that overlaps it — so asking them about an import
+    // could hand back the return binding of whichever export happens
+    // to share the number, pointing an origin walk at a value that
+    // never crossed here. Before M39 the guard was `fnIndex` never
+    // colliding, i.e. luck; now it is the edge's own kind.
+    const returnValueName = isImport
+      ? undefined
+      : (returnValueNames[exportName(fnIndex)] ?? lastResultBinding.get(fnIndex));
     if (leaving && returnValueName) {
       wasmMarker.showText = returnValueName;
     }
@@ -847,7 +897,6 @@ export function createBrowserWasmRecorder(options = {}) {
       frame.fnKind === FUNC_KIND_EXPORT
         ? exportName(frame.fnIndex)
         : `import #${frame.fnIndex}`;
-    noteRunForCrossingSeq(frame, role, label);
     // Each tuple gets a step of its own, and it has to: an origin walk
     // finds a binding's write by looking for the step where its value
     // first appears, which means there must be an earlier step in the
@@ -876,44 +925,6 @@ export function createBrowserWasmRecorder(options = {}) {
       });
     }
     return run;
-  }
-
-  /**
-   * Advance the mirrored crossing counter for a value run about to be
-   * emitted.
-   *
-   * This is the whole of the prediction described above; keeping it in
-   * one function is deliberate, because a second copy of the consumer's
-   * rule is exactly how the two would drift apart.
-   *
-   * @param {{fnKind: number, fnIndex: number}} frame
-   * @param {"arg"|"ret"} role
-   * @param {string} label
-   */
-  function noteRunForCrossingSeq(frame, role, label) {
-    if (frame.fnKind !== FUNC_KIND_IMPORT) {
-      // `assembler.closeRun` calls `closeDanglingImports("")` for any run
-      // that is not an open import's own result run, so an export's run
-      // closes whatever import was open.
-      openImportCrossing = null;
-      return;
-    }
-    if (role === "arg") {
-      // An argument run opens an import crossing — including a *second*
-      // argument run for the same import, which is a new call.
-      openImportCrossing = { label, seq: nextCrossingSeq++ };
-      inFlightImportSeq = openImportCrossing.seq;
-      return;
-    }
-    if (openImportCrossing !== null && openImportCrossing.label === label) {
-      inFlightImportSeq = openImportCrossing.seq;
-    } else {
-      // A result run with no matching open crossing is an import that
-      // took no arguments: its only trace on disk is this run.
-      inFlightImportSeq = nextCrossingSeq++;
-    }
-    // Either way the result run closes the crossing.
-    openImportCrossing = null;
   }
 
   return {
@@ -982,7 +993,8 @@ export function createBrowserWasmRecorder(options = {}) {
           }
         }
         if (topLevel) firstExportSeen = true;
-        openImportCrossing = null;
+        // `assembler.push` appends an export crossing the moment the
+        // `Call` record arrives, so the number is consumed here.
         nextCrossingSeq++;
         currentSiteId = frame.fnIndex;
         producer.send({ kind: "Step", siteId: frame.fnIndex });
@@ -1005,9 +1017,6 @@ export function createBrowserWasmRecorder(options = {}) {
           }
           return;
         }
-        // An export's `Return` closes any import the consumer still
-        // holds open (`assembler.push`'s Return arm).
-        openImportCrossing = null;
         if (tracksHostState() && openFrames.length === 0) {
           // Back at a quiescent point: re-baseline so a host write made
           // before the next top-level call is detected rather than
@@ -1026,12 +1035,28 @@ export function createBrowserWasmRecorder(options = {}) {
       },
 
       /** Realm-crossing hook — marks both sides of the boundary. */
-      __ct_emit_realm_boundary(direction, _fnKind, fnIndex, token) {
+      __ct_emit_realm_boundary(direction, fnKind, fnIndex, token) {
         if (stopped) return;
         // The realm marker sits between the argument tuple and the
         // call, so anything buffered here is that tuple.
         flushValues(pendingOwner, "arg");
-        emitRealmBoundary(direction | 0, token, fnIndex >>> 0);
+        const kind = fnKind | 0;
+        const dir = direction | 0;
+        if (kind === FUNC_KIND_IMPORT && dir === REALM_DIRECTION_ENTER) {
+          // The marker about to be emitted is what opens the import
+          // crossing for the consumer (`assembler.push`'s realm-marker
+          // arm), so this is where its `Seq` is decided — including for
+          // an import with an empty `() -> ()` signature, which reaches
+          // disk as nothing BUT this marker and its `LEAVE` partner.
+          //
+          // The argument run flushed just above is emitted before the
+          // marker record and opens the same crossing over there, one
+          // record earlier; either way the crossing lands at this
+          // position in the append order, so one assignment covers both
+          // shapes.
+          inFlightImportSeq = nextCrossingSeq++;
+        }
+        emitRealmBoundary(dir, kind, token, fnIndex >>> 0);
       },
 
       /** Strictly monotonic correlation key source. */

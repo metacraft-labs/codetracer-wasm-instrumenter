@@ -354,6 +354,117 @@ test("a void export's outbound marker names no binding", () => {
   assert.equal(outboundMarker(transport).showText, undefined);
 });
 
+// --- the two edges are spelled apart (M39) -------------------------------
+//
+// An import whose signature is `() -> ()` emits no `Call`, no `Return`
+// and no boundary value, so its pair of realm markers is the ONLY trace
+// it leaves in a recording. While both edges said `wasm export #<n>`
+// those markers could not be attributed to an import by their own
+// content, and `codetracer-wasm-recorder` recovered no crossing from
+// them — it replayed such a call unchecked, which spec §8 forbids.
+// These tests pin the two spellings apart, since the consumer's
+// `internal/boundarylog/recording.go` matches on them literally.
+
+/** Every realm marker put on the wire, as `"<direction> <payload>"`. */
+function markerLabels(transport) {
+  return transport
+    .lines()
+    .filter((l) => l.kind === "CorrelationMarker")
+    .map((l) => `${l.direction} ${l.payload}`);
+}
+
+test("an import crossing's markers name the IMPORT edge", () => {
+  const { r, transport } = recorder();
+  r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  // A `() -> ()` import: no arguments, no results, no Call/Return on the
+  // wire — the markers are the whole record of it.
+  r.imports.__ct_emit_call(FUNC_KIND_IMPORT, 7);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_IMPORT,
+    7,
+    r.imports.__ct_correlation_token(),
+  );
+  r.imports.__ct_emit_return(FUNC_KIND_IMPORT, 7);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_LEAVE,
+    FUNC_KIND_IMPORT,
+    7,
+    r.imports.__ct_correlation_token(),
+  );
+  r.imports.__ct_emit_return(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_LEAVE,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  r.stop();
+
+  assert.deepEqual(markerLabels(transport), [
+    "recv wasm export #0",
+    "recv wasm import #7",
+    "send wasm import #7",
+    "send wasm export #0",
+  ]);
+  // The index reaches disk AND is attributable: no `Call`, no `Return`
+  // and no `Value` was emitted for import #7.
+  const kinds = transport.lines().map((l) => l.kind);
+  assert.equal(kinds.filter((k) => k === "Call").length, 1);
+  assert.equal(kinds.filter((k) => k === "Return").length, 1);
+  assert.equal(kinds.filter((k) => k === "Value").length, 0);
+});
+
+test("an export and an import at the SAME index are told apart", () => {
+  // The guard that matters: the two numberings overlap, so a label that
+  // carried only the index would make `export #0` and `import #0`
+  // identical records.
+  const { r, transport } = recorder();
+  exportCall(r, [1], [2], () => {
+    importCall(r, 0, [], [], null);
+  });
+  r.stop();
+
+  assert.deepEqual(markerLabels(transport), [
+    "recv wasm export #0",
+    "recv wasm import #0",
+    "send wasm import #0",
+    "send wasm export #0",
+  ]);
+});
+
+test("an import's outbound marker never names an export's binding", () => {
+  // `showText` is the binding an origin chain resumes its walk on, and
+  // both sources of it (`returnValueNames`, `lastResultBinding`) are
+  // keyed by the EXPORT index. Asking them about an import index that
+  // happens to collide would resume the walk at a value that never
+  // crossed this edge.
+  const { r, transport } = recorder({
+    returnValueNames: { balance_of: "handle" },
+  });
+  exportCall(r, [1], [2], () => {
+    importCall(r, 0, [], [], null);
+  });
+  r.stop();
+
+  const markers = transport
+    .lines()
+    .filter((l) => l.kind === "CorrelationMarker");
+  const importLeave = markers.find((m) => m.payload === "wasm import #0" && m.direction === "send");
+  assert.equal(importLeave.showText, undefined);
+  // The control: the export's own outbound marker still names one, so
+  // the assertion above is about the edge and not about `showText`
+  // having stopped working.
+  const exportLeave = markers.find((m) => m.payload === "wasm export #0" && m.direction === "send");
+  assert.equal(exportLeave.showText, "handle");
+});
+
 test("every line put on the wire is serialisable JSON", () => {
   const { r, transport } = recorder();
   r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
@@ -742,9 +853,16 @@ test("registering after the first exported call is reported, not accepted", () =
   assert.ok(transport.lines().length > 0);
 });
 
-test("a host write during a valueless import is refused, not misanchored", () => {
-  // A `() -> ()` import leaves no value run, so the consumer recovers no
-  // crossing for it and there is no `afterCrossing` that would be true.
+test("a host write during a valueless import IS anchored (M39)", () => {
+  // This used to be a refusal, and the refusal was a consequence of the
+  // ambiguous marker label rather than of anything about the write: a
+  // `() -> ()` import leaves no value run, and while both edges said
+  // `wasm export #<n>` the consumer could recover no crossing from the
+  // markers either — so there was no `afterCrossing` that would be true.
+  //
+  // M39 spells the import edge apart, so the `ENTER` marker now opens
+  // the crossing and numbers it. The write has an anchor, and the
+  // recording carries the mutation instead of a console error.
   const { r, transport, memory } = hostStateRecorder();
   r.trackHostMemory({ memory });
   const errors = [];
@@ -761,9 +879,48 @@ test("a host write during a valueless import is refused, not misanchored", () =>
   }
   r.stop();
 
+  assert.equal(r.hostStateDiagnostics.unanchorableWrites, 0);
+  assert.deepEqual(errors, [], "nothing to refuse any more");
+  // Crossing 0 is the export (`assembler` appends it at the `Call`
+  // record); crossing 1 is the import, opened by its `ENTER` marker.
+  assert.deepEqual(
+    mutations(transport).map((m) => m.afterCrossing),
+    [1],
+  );
+  assert.deepEqual(mutations(transport)[0].memoryWrites, [
+    { module: "env", name: "memory", offset: 128, bytesB64: btoa("\x08") },
+  ]);
+});
+
+test("a host write with no ENTER marker for the call is still refused", () => {
+  // The refusal above is not gone, only re-aimed. §3.4 anchors a
+  // mutation to a crossing, so a host call that opened no crossing has
+  // nothing to anchor to whatever its signature is. Every edge
+  // `ct-instrument` rewrites emits the marker, so this shape means the
+  // hook stream did not come from it — which is exactly when guessing an
+  // anchor would put the write at somebody else's crossing.
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+  const errors = [];
+  const realError = console.error;
+  console.error = (msg) => errors.push(String(msg));
+  try {
+    exportCall(r, [0], [0], () => {
+      // `importCall` without its realm markers: call hook, host work,
+      // return hook.
+      r.imports.__ct_emit_call(FUNC_KIND_IMPORT, 3);
+      bytesOf(memory)[128] = 8;
+      r.imports.__ct_emit_return(FUNC_KIND_IMPORT, 3);
+    });
+  } finally {
+    console.error = realError;
+  }
+  r.stop();
+
   assert.equal(r.hostStateDiagnostics.unanchorableWrites, 1);
   assert.equal(mutations(transport).length, 0);
   assert.match(errors[0], /no crossing to anchor/);
+  assert.match(errors[0], /ENTER marker/);
 });
 
 test("an imported global's initial value and later set are recorded", () => {
