@@ -55,6 +55,14 @@
 // three-recording chain the cross-process composer is built to walk.
 
 import { resolveEndpoint, createWebSocketProducer } from "./host_runtime.js";
+import {
+  diffRegions,
+  encodeRegions,
+  encodeGlobalValue,
+  snapshotMemory,
+  readMemory,
+  pagesOf,
+} from "./host_state.js";
 
 /**
  * Boundary id shared with the db-backend's M25 marker family.
@@ -187,6 +195,43 @@ export function boundaryBindingName(label, role, slot) {
  *   its real output somewhere else, say. Keyed per export, because
  *   exports return different things and naming the wrong binding sends
  *   a chain crossing at one function looking for another's value.
+ * @property {HostMemoryDescriptor[]} [hostMemories] Memories the module
+ *   **imports** from this host, whose contents are therefore
+ *   host-supplied state the recording has to carry (spec §3.3 / §3.4).
+ *   A module that defines its own memory needs none of this — the
+ *   `.wasm` already contains it — which is why the default is empty.
+ *   Equivalent to calling {@link trackHostMemory} for each entry, and
+ *   subject to the same timing rule: see that method.
+ * @property {HostGlobalDescriptor[]} [hostGlobals] Globals the module
+ *   imports from this host. Same contract as `hostMemories`.
+ */
+
+/**
+ * @typedef {Object} HostMemoryDescriptor
+ * @property {WebAssembly.Memory} memory The live memory handed to
+ *   `WebAssembly.instantiate`.
+ * @property {string} [module] Import module name; defaults to `"env"`,
+ *   which is what `rust-lld --import-memory` and every C/C++ toolchain
+ *   emit.
+ * @property {string} [name] Import field name; defaults to `"memory"`.
+ * @property {number} [maxPages] Declared maximum, when the page created
+ *   the memory with one. Recorded because spec §7 makes `memory.grow`'s
+ *   result depend on the host limit, so a replay that does not know the
+ *   limit can diverge on a `grow` that failed in the browser.
+ */
+
+/**
+ * @typedef {Object} HostGlobalDescriptor
+ * @property {WebAssembly.Global} global The live global.
+ * @property {string} name Import field name. Required: unlike a memory
+ *   there is no conventional default.
+ * @property {"i32"|"i64"|"f32"|"f64"} type The global's value type. The
+ *   `WebAssembly.Global` object does not portably report it, and
+ *   guessing from the JS value cannot tell `i32` from `f32`.
+ * @property {string} [module] Import module name; defaults to `"env"`.
+ * @property {boolean} [mutable] Whether the module may write it —
+ *   which is also what decides whether a §3.4 mutation may target it.
+ *   Defaults to false.
  */
 
 /**
@@ -240,6 +285,412 @@ export function createBrowserWasmRecorder(options = {}) {
   /** @type {Map<number, string>} */
   const lastResultBinding = new Map();
 
+  // --- host-supplied state (spec §3.3 / §3.4) ---------------------------
+  //
+  // See `host_state.js` for *why* this is captured by snapshot-and-diff
+  // from the host side rather than by hooks inside the module. What is
+  // decided here is the two capture **windows**, and they are what make
+  // the diff exact rather than a guess:
+  //
+  //   §3.3  from the moment the memory is registered, to the module's
+  //         first exported call. The `__ct_emit_call` hook of an export
+  //         runs before any instruction of its body, so nothing the
+  //         *module* wrote can be inside this window — everything in it
+  //         was put there by the host or by the module's own data
+  //         segments, and the data segments are in the `.wasm`, so
+  //         registering after `WebAssembly.instantiate` (the natural
+  //         time, since the memory is already built) makes the record
+  //         exactly the host's contribution and nothing else.
+  //
+  //   §3.4  from `__ct_emit_call(IMPORT, n)` to `__ct_emit_return(IMPORT,
+  //         n)`. Between those two hooks the module is *suspended* inside
+  //         the host call: the only code that runs is the host's. So the
+  //         diff over this window is precisely the host's writes, with no
+  //         need to distinguish them from the module's — the module made
+  //         none. That is the whole reason §3.4 is anchored to an
+  //         imported call rather than sampled on a timer.
+  //
+  // Nothing is captured at all unless a memory or global is registered,
+  // which is the common case: a module that defines its own memory needs
+  // neither record.
+  //
+  // # What the windows rest on, and what closes the remaining hole
+  //
+  // Both windows are exact only because the *module* cannot run inside
+  // them. That is guaranteed by the instrumenter's emitted code — the
+  // export prologue is spliced at index 0 of the entry block, and the
+  // only module code between an import's two hooks is `local.set` /
+  // `local.get` spilling, which touches no linear memory. There is
+  // exactly one way for a module store to land inside a §3.4 window: the
+  // host function calls *back* into an exported function. Such a
+  // recording carries an export crossing at a non-zero depth, and the
+  // consumer **refuses** it outright (`replay.go`'s
+  // `refuseNestedExports`, on both the batch and the streaming path), so
+  // a host/module write to overlapping addresses cannot reach a
+  // materialised trace. It is refused rather than mis-attributed, which
+  // is the same spec §8 discipline as the two refusals below — it just
+  // happens to be enforced on the consumer's side.
+
+  /** @type {import("./host_state.js").TrackedMemory[]} */
+  const trackedMemories = [];
+  /** @type {import("./host_state.js").TrackedGlobal[]} */
+  const trackedGlobals = [];
+  /** Whether the §3.3 record has been emitted. */
+  let initialStateSent = false;
+  /**
+   * Host writes seen at a point the record cannot express — see
+   * `checkForUnrepresentableHostWrites`. Exposed for tests and for the
+   * fixture scripts, which assert it is zero.
+   */
+  let unrepresentableHostWrites = 0;
+  /**
+   * Imported calls during which the host wrote, but whose crossing the
+   * recording does not carry (a `() -> ()` import leaves no value run,
+   * so the replayer recovers no crossing to anchor a mutation to).
+   */
+  let unanchorableHostWrites = 0;
+  /**
+   * Registrations that arrived too late to define a §3.3 window.
+   *
+   * The baseline is taken at registration, so a memory registered after
+   * the module has already run puts whatever the *module* wrote into the
+   * baseline and, worse, makes the §3.3 record describe a state that is
+   * not the one preceding the first exported call. Both directions are
+   * silent losses, which is why this is counted rather than tolerated.
+   */
+  let lateRegistrations = 0;
+  /** Whether a top-level exported call has already been observed. */
+  let firstExportSeen = false;
+
+  // --- crossing sequence numbers ---------------------------------------
+  //
+  // A §3.4 mutation is anchored by `afterCrossing`, which is the
+  // `Crossing.Seq` the *consumer* assigns while recovering crossings from
+  // this recording's rendered records. So the number has to be predicted
+  // here, and it is predicted by mirroring the consumer's rule rather
+  // than by inventing one:
+  //
+  //   * `internal/boundarylog/assembler.go` appends an export crossing
+  //     when the `Call` record arrives, and an import crossing when that
+  //     import's value run *closes*. `Seq` is the append order.
+  //   * This runtime emits the `Call` record in `__ct_emit_call`, after
+  //     flushing whatever run was pending — so a pending import run is
+  //     numbered before the export, exactly as over there.
+  //   * An import's argument run is flushed at its realm marker, before
+  //     the host call; its result run at `__ct_emit_return`. An import
+  //     with neither contributes no crossing at all, on both sides.
+  //
+  // The prediction is not left to inspection: the fixture in
+  // `codetracer/src/db-backend/tests/fixtures/wasm-memory-calldata/`
+  // replays a real browser recording whose module reads the mutated
+  // bytes, so an anchor off by one produces a divergence rather than a
+  // subtly wrong trace.
+
+  /** Next `Crossing.Seq` the consumer will assign. */
+  let nextCrossingSeq = 0;
+  /**
+   * The import crossing the consumer currently holds open, if any.
+   * Mirrors `assembler.stack`'s import entries.
+   * @type {{label: string, seq: number}|null}
+   */
+  let openImportCrossing = null;
+  /**
+   * Seq of the crossing the imported call in flight will be recovered
+   * as, or null while that is not yet decided (or never will be).
+   * @type {number|null}
+   */
+  let inFlightImportSeq = null;
+
+  /**
+   * Register an imported memory whose contents are host-supplied.
+   *
+   * **Call this right after `WebAssembly.instantiate` and before the
+   * first exported call.** The memory's contents at this moment become
+   * the baseline the §3.3 record is a diff against, so registering after
+   * instantiation excludes the module's own data segments (which the
+   * replayer applies from the `.wasm` itself) and records only what the
+   * host put there. Registering *before* instantiation is also correct,
+   * just larger: the baseline is then an all-zero memory and the record
+   * carries every non-zero byte, data segments included, which the
+   * replayer rewrites over identical bytes.
+   *
+   * @param {HostMemoryDescriptor} descriptor
+   */
+  function trackHostMemory(descriptor) {
+    const memory = descriptor.memory;
+    if (memory == null || typeof memory.buffer === "undefined") {
+      throw new TypeError(
+        "trackHostMemory needs the WebAssembly.Memory object the module imports",
+      );
+    }
+    noteRegistrationTiming("trackHostMemory");
+    trackedMemories.push({
+      module: descriptor.module ?? "env",
+      name: descriptor.name ?? "memory",
+      memory,
+      maxPages: descriptor.maxPages ?? null,
+      baseline: snapshotMemory(memory),
+      shadow: null,
+    });
+  }
+
+  /**
+   * Register an imported global whose value is host-supplied.
+   *
+   * @param {HostGlobalDescriptor} descriptor
+   */
+  function trackHostGlobal(descriptor) {
+    if (descriptor == null || descriptor.global == null) {
+      throw new TypeError(
+        "trackHostGlobal needs the WebAssembly.Global object the module imports",
+      );
+    }
+    if (!descriptor.name) {
+      throw new TypeError("trackHostGlobal needs the global's import name");
+    }
+    if (!/^[if](32|64)$/.test(descriptor.type)) {
+      throw new TypeError(
+        `trackHostGlobal: unsupported global type ${JSON.stringify(descriptor.type)}; ` +
+          "only i32/i64/f32/f64 can cross a recorded boundary",
+      );
+    }
+    noteRegistrationTiming("trackHostGlobal");
+    trackedGlobals.push({
+      module: descriptor.module ?? "env",
+      name: descriptor.name,
+      type: descriptor.type,
+      mutable: descriptor.mutable === true,
+      global: descriptor.global,
+      baseline: encodeGlobalValue(descriptor.global.value),
+      shadow: null,
+    });
+  }
+
+  /**
+   * Report a registration that arrived after the §3.3 window had closed.
+   *
+   * §3.3 is *the state before the first exported call*. Registering after
+   * one has run makes the baseline a mid-execution state, so the record
+   * would silently omit whatever the host staged before that call and
+   * would be applied by the replayer at a point it never described. Like
+   * the two refusals below, this is reported at the cause instead of
+   * surfacing as a divergence somewhere unrelated (spec §8).
+   *
+   * It is not thrown: recording is best-effort and must never take a
+   * page down. The counter is what a fixture harness fails on.
+   *
+   * @param {string} api Name of the entry point, for the diagnostic.
+   */
+  function noteRegistrationTiming(api) {
+    if (!firstExportSeen) return;
+    lateRegistrations += 1;
+    // eslint-disable-next-line no-console
+    console.error(
+      `[codetracer] ${api} was called after the module's first exported ` +
+        "call. Spec §3.3 is the host-supplied state that preceded that " +
+        "call, and the baseline this takes now is a mid-execution state, " +
+        "so anything the host staged earlier is lost and what is recorded " +
+        "describes a moment the replayer has no hook for. Register every " +
+        "imported memory and global immediately after " +
+        "`WebAssembly.instantiate` and before calling into the module.",
+    );
+  }
+
+  /** Whether anything host-supplied is being tracked at all. */
+  function tracksHostState() {
+    return trackedMemories.length > 0 || trackedGlobals.length > 0;
+  }
+
+  /** Take the "window open" snapshot of every tracked entity. */
+  function openHostStateWindow() {
+    for (const m of trackedMemories) m.shadow = snapshotMemory(m.memory);
+    for (const g of trackedGlobals) {
+      g.shadow = encodeGlobalValue(g.global.value);
+    }
+  }
+
+  /**
+   * Close the window and return what the host changed inside it.
+   *
+   * @returns {{memoryWrites: object[], globalSets: object[]}}
+   */
+  function closeHostStateWindow() {
+    /** @type {object[]} */
+    const memoryWrites = [];
+    for (const m of trackedMemories) {
+      const regions = diffRegions(m.shadow, readMemory(m.memory));
+      m.shadow = null;
+      for (const r of encodeRegions(regions)) {
+        memoryWrites.push({ module: m.module, name: m.name, ...r });
+      }
+    }
+    /** @type {object[]} */
+    const globalSets = [];
+    for (const g of trackedGlobals) {
+      const now = encodeGlobalValue(g.global.value);
+      const was = g.shadow;
+      g.shadow = null;
+      if (was !== null && was !== now) {
+        globalSets.push({
+          module: g.module,
+          name: g.name,
+          type: g.type,
+          value: now,
+        });
+      }
+    }
+    return { memoryWrites, globalSets };
+  }
+
+  /**
+   * Emit the spec §3.3 record, once, immediately before the module's
+   * first exported call.
+   */
+  function sendInitialState() {
+    initialStateSent = true;
+    const memories = trackedMemories.map((m) => {
+      const current = readMemory(m.memory);
+      const record = {
+        module: m.module,
+        name: m.name,
+        minPages: pagesOf(m.memory),
+        maxPages: m.maxPages,
+        data: encodeRegions(diffRegions(m.baseline, current)),
+      };
+      // The baseline's job is done; from here the same field carries the
+      // "state at the last quiescent point", which is what makes a host
+      // write between two exported calls detectable.
+      m.baseline = new Uint8Array(current);
+      return record;
+    });
+    const globals = trackedGlobals.map((g) => {
+      const value = encodeGlobalValue(g.global.value);
+      g.shadow = null;
+      // Same handover as a memory's: from here the field carries the
+      // value at the last quiescent point, so a host assignment made
+      // between two exported calls is detectable rather than lost.
+      g.baseline = value;
+      return {
+        module: g.module,
+        name: g.name,
+        type: g.type,
+        mutable: g.mutable,
+        value,
+      };
+    });
+    producer.send({ kind: "HostInitialState", memories, globals });
+  }
+
+  /**
+   * Report a host write the record cannot place.
+   *
+   * The two records the spec defines are anchored: §3.3 is "before the
+   * first exported call" and §3.4 is "while servicing crossing N". A host
+   * write made *between* two top-level exported calls is neither, and
+   * there is no third anchor — the replayer applies initial state once
+   * and mutations inside import stubs, and has no hook between calls.
+   *
+   * Dropping it silently is the failure spec §8 exists to prevent: the
+   * replay would proceed and diverge later, at a point unrelated to the
+   * cause. So it is reported here, at the cause, and counted so the
+   * page's own harness can fail on it.
+   *
+   * Globals are checked alongside memories and for the same reason. An
+   * imported global the host reassigns between two calls is the same
+   * unanchorable write in a smaller container: the replayer sets a
+   * provider global once from the §3.3 record and thereafter only from a
+   * §3.4 mutation, so a reassignment made at neither point is simply
+   * never applied.
+   */
+  function checkForUnrepresentableHostWrites() {
+    for (const m of trackedMemories) {
+      const regions = diffRegions(m.baseline, readMemory(m.memory));
+      m.baseline = snapshotMemory(m.memory);
+      if (regions.length === 0) continue;
+      unrepresentableHostWrites += regions.length;
+      const where = regions
+        .map((r) => `${r.offset}..${r.offset + r.bytes.length}`)
+        .join(", ");
+      reportUnrepresentableWrite(
+        `host wrote to imported memory ${m.module}.${m.name} ` +
+          `between two top-level exported calls (${where})`,
+      );
+    }
+    for (const g of trackedGlobals) {
+      const now = encodeGlobalValue(g.global.value);
+      const was = g.baseline;
+      g.baseline = now;
+      if (was === null || was === now) continue;
+      unrepresentableHostWrites += 1;
+      reportUnrepresentableWrite(
+        `host assigned imported global ${g.module}.${g.name} ` +
+          `between two top-level exported calls (${was} -> ${now})`,
+      );
+    }
+  }
+
+  /**
+   * The shared half of the "no anchor exists for this" diagnostic.
+   *
+   * @param {string} what The write, described at its cause.
+   */
+  function reportUnrepresentableWrite(what) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[codetracer] ${what}. The boundary record has no anchor for such a ` +
+        "write — spec §3.3 covers only what preceded the FIRST exported " +
+        "call and §3.4 only what the host wrote while servicing an " +
+        "imported call — so the replay will not see it and will diverge. " +
+        "Move the write inside a host function the module calls, or make " +
+        "it part of the state that precedes the first call.",
+    );
+  }
+
+  /** Refresh the "state at the last quiescent point" baseline. */
+  function noteQuiescentPoint() {
+    for (const m of trackedMemories) m.baseline = snapshotMemory(m.memory);
+    for (const g of trackedGlobals) {
+      g.baseline = encodeGlobalValue(g.global.value);
+    }
+  }
+
+  /**
+   * Close the §3.4 window opened by an imported call and emit what the
+   * host changed inside it.
+   *
+   * @param {number} fnIndex Import index, for the diagnostic only.
+   */
+  function sendHostMutation(fnIndex) {
+    const { memoryWrites, globalSets } = closeHostStateWindow();
+    if (memoryWrites.length === 0 && globalSets.length === 0) return;
+    if (inFlightImportSeq === null) {
+      // The import contributed no boundary values, so the recording
+      // carries no crossing for it and there is nothing to anchor to.
+      // (The realm markers are on disk, but they use the same label
+      // template for both edges, so the consumer cannot attribute them
+      // to an import — see `recording.go`'s "How a crossing appears in a
+      // browser `.ct`".) Say so rather than dropping the write.
+      unanchorableHostWrites += memoryWrites.length + globalSets.length;
+      // eslint-disable-next-line no-console
+      console.error(
+        `[codetracer] the host wrote to imported state while servicing ` +
+          `import #${fnIndex}, but that import's signature carries no ` +
+          "boundary values, so the recording holds no crossing to anchor " +
+          "the write to (spec §3.4 anchors a mutation to the crossing it " +
+          "accompanied). The replay will not see it and will diverge. " +
+          "Give the import at least one argument or result.",
+      );
+      return;
+    }
+    producer.send({
+      kind: "HostMutation",
+      afterCrossing: inFlightImportSeq,
+      memoryWrites,
+      globalSets,
+    });
+    inFlightImportSeq = null;
+  }
+
   // Seed the session. `SessionStart` must be the first line on the wire
   // (the daemon rejects a duplicate and ignores events before it), and
   // the manifest immediately after so every subsequent `Step` resolves
@@ -247,6 +698,13 @@ export function createBrowserWasmRecorder(options = {}) {
   producer.send({ kind: "SessionStart", program, args: [] });
   if (manifest != null) {
     producer.send({ kind: "Manifest", manifest });
+  }
+
+  for (const descriptor of options.hostMemories ?? []) {
+    trackHostMemory(descriptor);
+  }
+  for (const descriptor of options.hostGlobals ?? []) {
+    trackHostGlobal(descriptor);
   }
 
   /**
@@ -389,6 +847,7 @@ export function createBrowserWasmRecorder(options = {}) {
       frame.fnKind === FUNC_KIND_EXPORT
         ? exportName(frame.fnIndex)
         : `import #${frame.fnIndex}`;
+    noteRunForCrossingSeq(frame, role, label);
     // Each tuple gets a step of its own, and it has to: an origin walk
     // finds a binding's write by looking for the step where its value
     // first appears, which means there must be an earlier step in the
@@ -417,6 +876,44 @@ export function createBrowserWasmRecorder(options = {}) {
       });
     }
     return run;
+  }
+
+  /**
+   * Advance the mirrored crossing counter for a value run about to be
+   * emitted.
+   *
+   * This is the whole of the prediction described above; keeping it in
+   * one function is deliberate, because a second copy of the consumer's
+   * rule is exactly how the two would drift apart.
+   *
+   * @param {{fnKind: number, fnIndex: number}} frame
+   * @param {"arg"|"ret"} role
+   * @param {string} label
+   */
+  function noteRunForCrossingSeq(frame, role, label) {
+    if (frame.fnKind !== FUNC_KIND_IMPORT) {
+      // `assembler.closeRun` calls `closeDanglingImports("")` for any run
+      // that is not an open import's own result run, so an export's run
+      // closes whatever import was open.
+      openImportCrossing = null;
+      return;
+    }
+    if (role === "arg") {
+      // An argument run opens an import crossing — including a *second*
+      // argument run for the same import, which is a new call.
+      openImportCrossing = { label, seq: nextCrossingSeq++ };
+      inFlightImportSeq = openImportCrossing.seq;
+      return;
+    }
+    if (openImportCrossing !== null && openImportCrossing.label === label) {
+      inFlightImportSeq = openImportCrossing.seq;
+    } else {
+      // A result run with no matching open crossing is an import that
+      // took no arguments: its only trace on disk is this run.
+      inFlightImportSeq = nextCrossingSeq++;
+    }
+    // Either way the result run closes the crossing.
+    openImportCrossing = null;
   }
 
   return {
@@ -459,12 +956,34 @@ export function createBrowserWasmRecorder(options = {}) {
           pendingOwner ? "arg" : "ret",
         );
         const frame = { fnKind: fnKind | 0, fnIndex: fnIndex >>> 0 };
+        const topLevel = openFrames.length === 0;
         openFrames.push(frame);
         pendingOwner = frame;
         // Imported-call hooks describe the module calling *out*; those
         // are recorded as the boundary markers below rather than as
         // frames of this recording. Store groups are not calls at all.
-        if (frame.fnKind !== FUNC_KIND_EXPORT) return;
+        if (frame.fnKind !== FUNC_KIND_EXPORT) {
+          if (frame.fnKind === FUNC_KIND_IMPORT && tracksHostState()) {
+            // Open the §3.4 window. Nothing but the host runs between
+            // here and the matching return hook, so whatever changes in
+            // between is the host's doing by construction.
+            inFlightImportSeq = null;
+            openHostStateWindow();
+          }
+          return;
+        }
+        if (tracksHostState() && topLevel) {
+          // This hook runs before any instruction of the export's body,
+          // so the memory still holds exactly what the host supplied.
+          if (!initialStateSent) {
+            sendInitialState();
+          } else {
+            checkForUnrepresentableHostWrites();
+          }
+        }
+        if (topLevel) firstExportSeen = true;
+        openImportCrossing = null;
+        nextCrossingSeq++;
         currentSiteId = frame.fnIndex;
         producer.send({ kind: "Step", siteId: frame.fnIndex });
         producer.send({ kind: "Call", fnId: frame.fnIndex, args: [] });
@@ -480,7 +999,21 @@ export function createBrowserWasmRecorder(options = {}) {
         // before flushing, which clears the owner.
         const isArgs = frame != null && frame === pendingOwner;
         const flushed = flushValues(frame, isArgs ? "arg" : "ret");
-        if ((fnKind | 0) !== FUNC_KIND_EXPORT) return;
+        if ((fnKind | 0) !== FUNC_KIND_EXPORT) {
+          if ((fnKind | 0) === FUNC_KIND_IMPORT && tracksHostState()) {
+            sendHostMutation(fnIndex >>> 0);
+          }
+          return;
+        }
+        // An export's `Return` closes any import the consumer still
+        // holds open (`assembler.push`'s Return arm).
+        openImportCrossing = null;
+        if (tracksHostState() && openFrames.length === 0) {
+          // Back at a quiescent point: re-baseline so a host write made
+          // before the next top-level call is detected rather than
+          // confused with what the module just did.
+          noteQuiescentPoint();
+        }
         const returned =
           !isArgs && flushed.length === 1
             ? { value: flushed[0].value, typeKind: flushed[0].typeKind }
@@ -507,6 +1040,29 @@ export function createBrowserWasmRecorder(options = {}) {
         nextToken += 1n;
         return t;
       },
+    },
+
+    /** Register an imported memory — see the inner docs. */
+    trackHostMemory,
+    /** Register an imported global — see the inner docs. */
+    trackHostGlobal,
+
+    /**
+     * Host writes this recording could not place, by category.
+     *
+     * Every counter is zero for a well-formed page. A non-zero one means
+     * the recording is missing an input and its replay will diverge; a
+     * harness that regenerates a fixture should fail on any of them
+     * rather than commit a recording that cannot be replayed. Check them
+     * as a set — `Object.values(...).some((n) => n !== 0)` — so a counter
+     * added later is not silently ignored.
+     */
+    get hostStateDiagnostics() {
+      return {
+        unrepresentableWrites: unrepresentableHostWrites,
+        unanchorableWrites: unanchorableHostWrites,
+        lateRegistrations,
+      };
     },
 
     /** Force any buffered events onto the wire. */

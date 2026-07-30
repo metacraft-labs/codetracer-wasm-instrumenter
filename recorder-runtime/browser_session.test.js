@@ -371,3 +371,493 @@ test("every line put on the wire is serialisable JSON", () => {
   // parse below is the proof it never reaches the producer.
   assert.ok(transport.lines().length > 0);
 });
+
+// ---------------------------------------------------------------------
+// Host-supplied state (spec §3.3) and host mutation during a call (§3.4)
+// ---------------------------------------------------------------------
+//
+// The `WebAssembly.Memory` below is a real one and the "host writes" are
+// real writes through a real `Uint8Array` view — which is the point: the
+// capture is a diff of that memory, so a stub memory would test the
+// arithmetic and nothing about the mechanism. What is driven by hand is
+// the hook stream, exactly as in the tests above, because the framing
+// windows are defined in terms of hook order.
+
+/** Byte view over a tracked memory, rebuilt each time (grow detaches). */
+function bytesOf(memory) {
+  return new Uint8Array(memory.buffer);
+}
+
+/** Decode a recorded region payload the way the Go consumer does. */
+function decodeB64(b64) {
+  return Array.from(Buffer.from(b64, "base64"));
+}
+
+function hostStateRecorder(options = {}) {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const { r, transport } = recorder({
+    manifest: { functions: [{ name: "settle" }] },
+    ...options,
+  });
+  return { r, transport, memory };
+}
+
+/** Drive one complete exported call, running `body` inside it. */
+function exportCall(r, args, results, body) {
+  r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
+  args.forEach((a, i) => r.imports.__ct_emit_i32(i, a));
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  if (body) body();
+  results.forEach((v, i) => r.imports.__ct_emit_i32(i, v));
+  r.imports.__ct_emit_return(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_LEAVE,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+}
+
+/**
+ * Drive one imported call the way `replace_imported_call` splices it,
+ * running `hostBody` at the exact point the real host function would run.
+ */
+function importCall(r, importIndex, args, results, hostBody) {
+  r.imports.__ct_emit_call(FUNC_KIND_IMPORT, importIndex);
+  args.forEach((a, i) => r.imports.__ct_emit_i32(i, a));
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_IMPORT,
+    importIndex,
+    r.imports.__ct_correlation_token(),
+  );
+  if (hostBody) hostBody();
+  results.forEach((v, i) => r.imports.__ct_emit_i32(i, v));
+  r.imports.__ct_emit_return(FUNC_KIND_IMPORT, importIndex);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_LEAVE,
+    FUNC_KIND_IMPORT,
+    importIndex,
+    r.imports.__ct_correlation_token(),
+  );
+}
+
+const initialStates = (t) =>
+  t.lines().filter((l) => l.kind === "HostInitialState");
+const mutations = (t) => t.lines().filter((l) => l.kind === "HostMutation");
+
+test("nothing host-state is recorded when nothing is registered", () => {
+  // The overwhelmingly common case: a module that defines its own memory
+  // needs neither record, and must not pay for a diff it does not need.
+  const { r, transport } = hostStateRecorder();
+  exportCall(r, [1], [2]);
+  r.stop();
+  assert.equal(initialStates(transport).length, 0);
+  assert.equal(mutations(transport).length, 0);
+});
+
+test("what the host put in memory before the first export is §3.3 state", () => {
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ module: "env", name: "memory", memory });
+
+  // The host writes its calldata, exactly as a wasm-bindgen glue layer
+  // or a Stylus host would.
+  bytesOf(memory).set([7, 0, 0, 0, 100, 0, 0, 0], 1024);
+
+  exportCall(r, [0], [42]);
+  r.stop();
+
+  const records = initialStates(transport);
+  assert.equal(records.length, 1, "emitted once, before the first call");
+  assert.deepEqual(records[0].memories.length, 1);
+  const m = records[0].memories[0];
+  assert.equal(m.module, "env");
+  assert.equal(m.name, "memory");
+  assert.equal(m.minPages, 1);
+  assert.equal(m.maxPages, null);
+  assert.deepEqual(m.data.map((d) => d.offset), [1024]);
+  assert.deepEqual(
+    decodeB64(m.data[0].bytesB64),
+    [7, 0, 0, 0, 100],
+    "the run ends at the last byte that differs from the baseline: the " +
+      "three trailing zeros are already zero, so recording them would be " +
+      "recording bytes the host did not change",
+  );
+});
+
+test("the §3.3 record excludes what was already there when registered", () => {
+  // Registering after `WebAssembly.instantiate` is the documented time,
+  // and it is what keeps the module's own data segments out of the
+  // record: the replayer applies those from the `.wasm` itself.
+  const { r, transport, memory } = hostStateRecorder();
+  bytesOf(memory).set([1, 2, 3, 4], 16); // stands in for a data segment
+  r.trackHostMemory({ memory });
+  bytesOf(memory).set([9], 2048); // the host's own contribution
+
+  exportCall(r, [0], [0]);
+  r.stop();
+
+  const m = initialStates(transport)[0].memories[0];
+  assert.deepEqual(m.data.map((d) => d.offset), [2048]);
+});
+
+test("the §3.3 record is emitted before the first Call record", () => {
+  // The replayer applies initial state before driving any export, so a
+  // record that arrived later would describe state the first call had
+  // already run without.
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+  bytesOf(memory)[8] = 1;
+  exportCall(r, [0], [0]);
+  r.stop();
+
+  const kinds = transport.lines().map((l) => l.kind);
+  assert.ok(
+    kinds.indexOf("HostInitialState") < kinds.indexOf("Call"),
+    `HostInitialState must precede the first Call: ${kinds.join(",")}`,
+  );
+});
+
+test("a host write while servicing an import is a §3.4 mutation", () => {
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+  bytesOf(memory).set([7, 0, 0, 0], 1024);
+
+  exportCall(r, [0], [55], () => {
+    importCall(r, 0, [7], [1], () => {
+      // The host writes the fee into the calldata slot and returns only
+      // a status code — the Stylus `storage_load_bytes32` shape.
+      bytesOf(memory).set([250, 0, 0, 0], 1032);
+    });
+  });
+  r.stop();
+
+  const recorded = mutations(transport);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].memoryWrites.length, 1);
+  const w = recorded[0].memoryWrites[0];
+  assert.equal(w.module, "env");
+  assert.equal(w.name, "memory");
+  assert.equal(w.offset, 1032);
+  assert.deepEqual(decodeB64(w.bytesB64), [250]);
+});
+
+test("a §3.4 mutation is anchored to the import's own crossing", () => {
+  // `afterCrossing` is the `Crossing.Seq` the Go assembler assigns while
+  // recovering crossings from this recording. Crossing 0 is the export
+  // (opened by its `Call` record); crossings 1 and 2 are the two
+  // imported calls, in the order their argument runs close.
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+
+  exportCall(r, [0], [0], () => {
+    importCall(r, 0, [1], [1], () => {
+      bytesOf(memory)[100] = 11;
+    });
+    importCall(r, 1, [2], [1], () => {
+      bytesOf(memory)[200] = 22;
+    });
+  });
+  r.stop();
+
+  assert.deepEqual(
+    mutations(transport).map((m) => [
+      m.afterCrossing,
+      m.memoryWrites[0].offset,
+    ]),
+    [
+      [1, 100],
+      [2, 200],
+    ],
+  );
+});
+
+test("crossing numbering survives several exported calls", () => {
+  // Three calls, each making one import: the crossings are
+  // 0=export,1=import, 2=export,3=import, 4=export,5=import.
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+
+  for (let call = 0; call < 3; call++) {
+    exportCall(r, [call], [0], () => {
+      importCall(r, 0, [call], [1], () => {
+        bytesOf(memory)[300 + call] = 1;
+      });
+    });
+  }
+  r.stop();
+
+  assert.deepEqual(
+    mutations(transport).map((m) => m.afterCrossing),
+    [1, 3, 5],
+  );
+});
+
+test("an import that takes no arguments still anchors its mutation", () => {
+  // Such a crossing exists on disk only as its *result* run, and the
+  // consumer numbers it when that run closes.
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+
+  exportCall(r, [0], [0], () => {
+    importCall(r, 0, [], [1], () => {
+      bytesOf(memory)[64] = 5;
+    });
+  });
+  r.stop();
+
+  assert.deepEqual(
+    mutations(transport).map((m) => m.afterCrossing),
+    [1],
+  );
+});
+
+test("writes the MODULE makes are not reported as host mutations", () => {
+  // The §3.4 window is exactly the span in which the module is suspended
+  // inside the host call. A diff over a wider window would attribute the
+  // module's own stores to the host, and the replayer would rewrite them
+  // over a re-execution that had already produced them.
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+
+  exportCall(r, [0], [0], () => {
+    bytesOf(memory)[10] = 1; // module store, before the call
+    importCall(r, 0, [1], [1], null); // host writes nothing
+    bytesOf(memory)[11] = 1; // module store, after the call
+  });
+  r.stop();
+
+  assert.deepEqual(mutations(transport), []);
+});
+
+test("a host write between two exported calls is refused, not invented", () => {
+  // Neither §3.3 (before the FIRST call) nor §3.4 (during an import)
+  // covers it, and the replayer has no hook to apply it at. Reporting it
+  // at the cause is spec §8's discipline; dropping it would surface as a
+  // divergence far away from the write.
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+  const errors = [];
+  const realError = console.error;
+  console.error = (msg) => errors.push(String(msg));
+  try {
+    exportCall(r, [0], [0]);
+    bytesOf(memory)[512] = 3;
+    exportCall(r, [1], [0]);
+  } finally {
+    console.error = realError;
+  }
+  r.stop();
+
+  assert.equal(r.hostStateDiagnostics.unrepresentableWrites, 1);
+  assert.equal(mutations(transport).length, 0, "nothing is invented");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /between two top-level exported calls/);
+});
+
+test("a global the host reassigns between two calls is refused too", () => {
+  // The same unanchorable write in a smaller container, and the one the
+  // memory-only check used to drop in silence: the replayer sets a
+  // provider global from the §3.3 record and thereafter only from a §3.4
+  // mutation, so an assignment made at neither point is never applied
+  // and the replay diverges with nothing pointing back at the cause.
+  const { r, transport } = hostStateRecorder();
+  const global = new WebAssembly.Global({ value: "i32", mutable: true }, 25);
+  r.trackHostGlobal({ global, name: "fee_bps", type: "i32", mutable: true });
+  const errors = [];
+  const realError = console.error;
+  console.error = (msg) => errors.push(String(msg));
+  try {
+    exportCall(r, [0], [0]);
+    global.value = 999;
+    exportCall(r, [1], [0]);
+  } finally {
+    console.error = realError;
+  }
+  r.stop();
+
+  assert.equal(r.hostStateDiagnostics.unrepresentableWrites, 1);
+  assert.equal(mutations(transport).length, 0, "nothing is invented");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /imported global env\.fee_bps/);
+  assert.match(errors[0], /25 -> 999/);
+});
+
+test("a global set during an import is still a §3.4 mutation, not a refusal", () => {
+  // The control for the test above: the between-calls check must not
+  // start reporting the writes that DO have an anchor.
+  const { r, transport } = hostStateRecorder();
+  const global = new WebAssembly.Global({ value: "i32", mutable: true }, 25);
+  r.trackHostGlobal({ global, name: "fee_bps", type: "i32", mutable: true });
+
+  exportCall(r, [0], [0], () => {
+    importCall(r, 0, [1], [1], () => {
+      global.value = 250;
+    });
+  });
+  exportCall(r, [1], [0]);
+  r.stop();
+
+  assert.equal(r.hostStateDiagnostics.unrepresentableWrites, 0);
+  assert.deepEqual(
+    mutations(transport).map((m) => [m.afterCrossing, m.globalSets]),
+    [[1, [{ module: "env", name: "fee_bps", type: "i32", value: "250" }]]],
+  );
+});
+
+test("registering after the first exported call is reported, not accepted", () => {
+  // §3.3 is *the state before the first exported call*. A baseline taken
+  // afterwards is a mid-execution state, so whatever the host staged
+  // before that call is lost and what is recorded describes a moment the
+  // replayer has no hook for — both silent, which is why the timing rule
+  // is enforced rather than only documented.
+  const { r, transport, memory } = hostStateRecorder();
+  const errors = [];
+  const realError = console.error;
+  console.error = (msg) => errors.push(String(msg));
+  try {
+    exportCall(r, [0], [0]);
+    r.trackHostMemory({ memory });
+  } finally {
+    console.error = realError;
+  }
+  r.stop();
+
+  assert.equal(r.hostStateDiagnostics.lateRegistrations, 1);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /after the module's first exported call/);
+  // Registration before the first call stays silent, which is the
+  // control proving the guard is on the timing and not on the call.
+  const clean = hostStateRecorder();
+  clean.r.trackHostMemory({ memory: clean.memory });
+  exportCall(clean.r, [0], [0]);
+  clean.r.stop();
+  assert.equal(clean.r.hostStateDiagnostics.lateRegistrations, 0);
+  assert.equal(initialStates(clean.transport).length, 1);
+  assert.ok(transport.lines().length > 0);
+});
+
+test("a host write during a valueless import is refused, not misanchored", () => {
+  // A `() -> ()` import leaves no value run, so the consumer recovers no
+  // crossing for it and there is no `afterCrossing` that would be true.
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+  const errors = [];
+  const realError = console.error;
+  console.error = (msg) => errors.push(String(msg));
+  try {
+    exportCall(r, [0], [0], () => {
+      importCall(r, 3, [], [], () => {
+        bytesOf(memory)[128] = 8;
+      });
+    });
+  } finally {
+    console.error = realError;
+  }
+  r.stop();
+
+  assert.equal(r.hostStateDiagnostics.unanchorableWrites, 1);
+  assert.equal(mutations(transport).length, 0);
+  assert.match(errors[0], /no crossing to anchor/);
+});
+
+test("an imported global's initial value and later set are recorded", () => {
+  const { r, transport } = hostStateRecorder();
+  const fee = new WebAssembly.Global({ value: "i32", mutable: true }, 25);
+  r.trackHostGlobal({ name: "fee_bps", type: "i32", mutable: true, global: fee });
+
+  exportCall(r, [0], [0], () => {
+    importCall(r, 0, [1], [1], () => {
+      fee.value = 250;
+    });
+  });
+  r.stop();
+
+  assert.deepEqual(initialStates(transport)[0].globals, [
+    {
+      module: "env",
+      name: "fee_bps",
+      type: "i32",
+      mutable: true,
+      value: "25",
+    },
+  ]);
+  assert.deepEqual(mutations(transport)[0].globalSets, [
+    { module: "env", name: "fee_bps", type: "i32", value: "250" },
+  ]);
+});
+
+test("an i64 global keeps its exact value", () => {
+  const { r, transport } = hostStateRecorder();
+  const handle = new WebAssembly.Global(
+    { value: "i64", mutable: false },
+    9223372036854775807n,
+  );
+  r.trackHostGlobal({ name: "handle", type: "i64", global: handle });
+  exportCall(r, [0], [0]);
+  r.stop();
+
+  assert.equal(
+    initialStates(transport)[0].globals[0].value,
+    "9223372036854775807",
+  );
+});
+
+test("a declared memory maximum reaches the record", () => {
+  // Spec §7: `memory.grow`'s result depends on the host limit, so a
+  // replay that does not know the limit can diverge on a failed grow.
+  const memory = new WebAssembly.Memory({ initial: 1, maximum: 4 });
+  const { r, transport } = recorder({
+    manifest: { functions: [{ name: "settle" }] },
+  });
+  r.trackHostMemory({ memory, maxPages: 4 });
+  exportCall(r, [0], [0]);
+  r.stop();
+  assert.equal(initialStates(transport)[0].memories[0].maxPages, 4);
+});
+
+test("host-state records are serialisable JSON like every other line", () => {
+  const { r, transport, memory } = hostStateRecorder();
+  r.trackHostMemory({ memory });
+  bytesOf(memory)[1] = 1;
+  exportCall(r, [0], [0], () => {
+    importCall(r, 0, [1], [1], () => {
+      bytesOf(memory)[2] = 2;
+    });
+  });
+  r.stop();
+  // `lines()` parses every chunk, so reaching here at all proves the
+  // records went out as JSON — no Uint8Array, no BigInt.
+  assert.equal(initialStates(transport).length, 1);
+  assert.equal(mutations(transport).length, 1);
+});
+
+test("registering through the constructor is the same as trackHostMemory", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const { r, transport } = recorder({
+    manifest: { functions: [{ name: "settle" }] },
+    hostMemories: [{ memory }],
+  });
+  // The baseline is taken when the memory is registered — at
+  // construction here — so this write is host state either way.
+  bytesOf(memory)[7] = 3;
+  exportCall(r, [0], [0]);
+  r.stop();
+  assert.deepEqual(
+    initialStates(transport)[0].memories[0].data.map((d) => d.offset),
+    [7],
+  );
+});
+
+test("an unsupported global type is refused at registration", () => {
+  const { r } = hostStateRecorder();
+  assert.throws(
+    () => r.trackHostGlobal({ name: "r", type: "externref", global: {} }),
+    /unsupported global type/,
+  );
+});

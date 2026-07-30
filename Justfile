@@ -43,7 +43,7 @@ test-plugins:
 # `test` for the same reason as `test-plugins`: `test` is the cargo
 # graph `repro test` mirrors one-for-one.
 test-runtime:
-    cd recorder-runtime && node --test host_runtime.test.js browser_session.test.js
+    cd recorder-runtime && node --test host_runtime.test.js browser_session.test.js host_state.test.js
 
 # --- Lint -------------------------------------------------------------
 
