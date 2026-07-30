@@ -50,6 +50,48 @@
  */
 export const DEFAULT_ENDPOINT = "ws://localhost:9230/ct-stream";
 
+// ── Flush policy ──────────────────────────────────────────────────────────
+//
+// Two bounds, and the buffer drains at whichever is reached first. Both
+// numbers live here rather than inline because the trade-off between them is
+// the whole design, and the count alone had no rationale recorded against it
+// (M38d). One policy, mirrored in `@codetracer/runtime-browser`.
+//
+// The cost being traded is a WebSocket frame per event against a recording
+// that only exists once the page has ended.
+// `codetracer-specs/Recording-Backends/WASM-Replay-Snapshots-And-Slices.md`
+// §2 requires the second not to happen: a replaying consumer derives
+// snapshots from this stream *while the page runs*, so a recording delivered
+// in one batch at `close()` makes §2's timeline unreachable however promptly
+// everything downstream works. A count-only policy does exactly that for any
+// page producing fewer events than the threshold — which is most short pages,
+// and every fixture that consumes this runtime.
+
+/**
+ * Events buffered before a flush. Bounds the *memory* a burst can occupy and
+ * amortises the per-frame overhead over a batch; 256 events is a few tens of
+ * kilobytes of JSON. This is the bound a hot loop is governed by.
+ */
+export const DEFAULT_FLUSH_THRESHOLD = 256;
+
+/**
+ * Milliseconds an event may wait before it is shipped regardless of how full
+ * the buffer is, measured from the batch's first event.
+ *
+ * Bounds the *latency* an event can suffer, and deliberately is not "small":
+ * the interval caps timer-driven frames at `1000 / interval` per second no
+ * matter how fast events arrive, so the policy's cost is a constant rather
+ * than something proportional to the workload. At 50ms that is 20 frames per
+ * second, and any page producing more than `256 / 0.05 = 5120` events per
+ * second reaches the count threshold first and never arms the timer at all —
+ * a hot loop pays nothing. Below that rate the page is human-scale, where
+ * 50ms is under the ~100ms at which a person perceives a reaction as
+ * immediate.
+ *
+ * `0` disables the time-based flush and restores a purely count-based policy.
+ */
+export const DEFAULT_FLUSH_INTERVAL_MS = 50;
+
 /**
  * Resolve the effective WebSocket endpoint per the M26 producer
  * lookup order (explicit option > `window.__codetracer_endpoint` >
@@ -97,9 +139,16 @@ export const defaultWebSocketFactory = (url) => {
  *
  *   * buffers events while the socket is CONNECTING,
  *   * flushes whenever the buffer reaches `flushThreshold`,
+ *   * flushes whenever `flushIntervalMs` has elapsed since the
+ *     batch's first event, whatever the buffer holds,
  *   * tolerates transport errors silently (recording is
  *     best-effort — the host program must never crash because
  *     the daemon socket went away mid-recording).
+ *
+ * The two bounds and the reasoning behind their defaults are
+ * {@link DEFAULT_FLUSH_THRESHOLD} and {@link DEFAULT_FLUSH_INTERVAL_MS}.
+ * This is one policy shared with `@codetracer/runtime-browser`, and the
+ * two implementations are mirrors: change one, change the other.
  *
  * @typedef {{send(payload: string): void, close(): void, readyState: number, onopen?: () => void}} WasmHostTransport
  * @typedef {(url: string) => WasmHostTransport} WasmHostTransportFactory
@@ -108,6 +157,7 @@ export const defaultWebSocketFactory = (url) => {
  *   endpoint?: string,
  *   transportFactory?: WasmHostTransportFactory,
  *   flushThreshold?: number,
+ *   flushIntervalMs?: number,
  * }} [options]
  * @returns {{
  *   send(event: object): void,
@@ -120,12 +170,19 @@ export const defaultWebSocketFactory = (url) => {
 export function createWebSocketProducer(options = {}) {
   const endpoint = resolveEndpoint(options.endpoint);
   const factory = options.transportFactory ?? defaultWebSocketFactory;
-  const threshold = options.flushThreshold ?? 256;
+  const threshold = options.flushThreshold ?? DEFAULT_FLUSH_THRESHOLD;
+  const flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
   /** @type {string[]} */
   let queue = [];
   /** @type {WasmHostTransport | null} */
   let transport = null;
   let closed = false;
+  /**
+   * Pending time-based flush, armed when a batch starts and cleared the
+   * moment the batch leaves. `null` means no deadline is outstanding.
+   * @type {ReturnType<typeof setTimeout> | null}
+   */
+  let flushTimer = null;
   try {
     transport = factory(endpoint);
   } catch {
@@ -144,6 +201,40 @@ export function createWebSocketProducer(options = {}) {
     }
   }
 
+  function cancelFlushTimer() {
+    if (flushTimer === null) return;
+    try {
+      clearTimeout(flushTimer);
+    } catch {
+      /* some sandboxed contexts restrict timers */
+    }
+    flushTimer = null;
+  }
+
+  function armFlushTimer() {
+    if (flushIntervalMs <= 0 || flushTimer !== null || closed) return;
+    if (typeof setTimeout !== "function") return;
+    try {
+      flushTimer = setTimeout(onFlushDeadline, flushIntervalMs);
+      // Node keeps its event loop alive for a pending timer, and a recorder
+      // must never be the reason a process refuses to exit. Browsers have
+      // no `unref` and need none.
+      flushTimer?.unref?.();
+    } catch {
+      flushTimer = null;
+    }
+  }
+
+  function onFlushDeadline() {
+    flushTimer = null;
+    drain();
+    // Still queued means the socket has not opened yet — `drain` is a no-op
+    // while CONNECTING. Renew the deadline for as long as it is still
+    // trying, and no longer: a page with no daemon behind it must not poll
+    // forever, and `onopen` drains the backlog anyway.
+    if (queue.length > 0 && transport?.readyState === 0) armFlushTimer();
+  }
+
   function drain() {
     if (!transport || closed) return;
     if (transport.readyState !== 1) return;
@@ -156,13 +247,23 @@ export function createWebSocketProducer(options = {}) {
       // the socket down mid-stream.
     }
     queue = [];
+    // The batch this deadline belonged to has left; the next one arms its own.
+    cancelFlushTimer();
   }
 
   return {
     send(event) {
       if (closed) return;
       queue.push(JSON.stringify(event));
-      if (queue.length >= threshold) drain();
+      if (queue.length >= threshold) {
+        drain();
+        return;
+      }
+      // The deadline runs from the FIRST event of a batch, not the last, so
+      // a steady dribble cannot postpone its own delivery indefinitely.
+      // Arming on the empty-to-non-empty transition is what makes that true,
+      // and keeps the per-event cost to one integer comparison.
+      if (queue.length === 1) armFlushTimer();
     },
     flush() {
       drain();
@@ -171,6 +272,7 @@ export function createWebSocketProducer(options = {}) {
       if (closed) return;
       drain();
       closed = true;
+      cancelFlushTimer();
       try {
         transport?.close();
       } catch {
@@ -208,6 +310,10 @@ export function createWebSocketProducer(options = {}) {
  *   given URL.
  * @property {(url: string) => {send(payload: string): void, close(): void, readyState: number, onopen?: () => void}} [transportFactory]
  *   Forwarded to the internal producer (test seam).
+ * @property {number} [flushThreshold]
+ *   Forwarded to the internal producer.
+ * @property {number} [flushIntervalMs]
+ *   Forwarded to the internal producer.
  */
 
 /**
@@ -287,6 +393,8 @@ export function createRecorderRuntime(options = {}) {
     producer = createWebSocketProducer({
       endpoint: options.endpoint,
       transportFactory: options.transportFactory,
+      flushThreshold: options.flushThreshold,
+      flushIntervalMs: options.flushIntervalMs,
     });
     ownsProducer = true;
   }

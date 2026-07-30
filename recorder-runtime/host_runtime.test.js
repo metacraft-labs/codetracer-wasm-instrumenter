@@ -8,6 +8,7 @@ import {
   createRecorderRuntime,
   createWebSocketProducer,
   DEFAULT_ENDPOINT,
+  DEFAULT_FLUSH_INTERVAL_MS,
   decodeSlot,
   resolveEndpoint,
 } from "./host_runtime.js";
@@ -281,4 +282,150 @@ test("decodeSlot round-trips a boundary value slot", () => {
     valueType: "f64",
     bits: "4613937818241073152",
   });
+});
+
+// ── M38d: the flush policy has a time bound as well as a count bound ──────
+//
+// `WASM-Replay-Snapshots-And-Slices.md` §2 requires a consumer to be able to
+// derive snapshots from this stream *while the page is still running*. That
+// is unreachable for any page producing fewer events than the count
+// threshold, because a count-only policy hands the daemon the whole recording
+// in one batch at `close()` — and most short pages, including every fixture
+// that consumes this runtime, are exactly that.
+//
+// These tests measure **arrival times against a transport that records them**,
+// not a final total. A total cannot tell "delivered during the run" from
+// "delivered at the end", which is the entire distinction under test.
+
+const sleep = (ms) => new Promise((resume) => setTimeout(resume, ms));
+
+/** A transport that timestamps every frame it receives and its own close. */
+class TimingSocket {
+  constructor() {
+    this.readyState = 1; // WHATWG OPEN
+    this.arrivals = [];
+    this.closedAt = null;
+    this.onopen = null;
+  }
+  send(payload) {
+    this.arrivals.push({ at: performance.now(), payload });
+  }
+  close() {
+    this.closedAt = performance.now();
+  }
+}
+
+test("a session far below the flush threshold reaches the transport during the run", async () => {
+  const socket = new TimingSocket();
+  // No `flushThreshold` and no `flushIntervalMs`: the DEFAULTS are what this
+  // pins, because "a default-configured page never streams" is the defect.
+  const producer = createWebSocketProducer({
+    endpoint: "ws://test/ct-stream",
+    transportFactory: () => socket,
+  });
+
+  // Three events against a threshold of 256. Under the count-only policy
+  // these would sit in the buffer until `close()`.
+  producer.send({ kind: "WasmCall", fn_kind: 0, fn_index: 1 });
+  producer.send({ kind: "WasmReturn", fn_kind: 0, fn_index: 1 });
+  producer.send({ kind: "WasmCall", fn_kind: 0, fn_index: 2 });
+  assert.equal(
+    socket.arrivals.length,
+    0,
+    "nothing can have been shipped synchronously — the count threshold is 256",
+  );
+
+  await sleep(DEFAULT_FLUSH_INTERVAL_MS * 4);
+
+  // Asserted BEFORE anything closes the session: this is the observation that
+  // the events were delivered during the run, and it is not recoverable from
+  // a final total.
+  assert.ok(
+    socket.arrivals.length >= 1,
+    `expected the time-based flush to have shipped the batch within ` +
+      `${DEFAULT_FLUSH_INTERVAL_MS * 4}ms; got ${socket.arrivals.length} frame(s)`,
+  );
+  const lines = socket.arrivals
+    .flatMap((a) => a.payload.trim().split("\n"))
+    .map((l) => JSON.parse(l));
+  assert.equal(lines.length, 3, "every event arrived, not just the first");
+
+  producer.close();
+  for (const arrival of socket.arrivals) {
+    assert.ok(
+      arrival.at < socket.closedAt,
+      "every frame must predate the session close",
+    );
+  }
+});
+
+test("with the time-based flush disabled nothing arrives until close", async () => {
+  // The negative control for the test above. Without it, that test would pass
+  // just as well against a producer that shipped on every `send`, and would
+  // say nothing about *which* bound delivered the batch.
+  const socket = new TimingSocket();
+  const producer = createWebSocketProducer({
+    endpoint: "ws://test/ct-stream",
+    transportFactory: () => socket,
+    flushIntervalMs: 0,
+  });
+  producer.send({ kind: "WasmCall", fn_kind: 0, fn_index: 1 });
+  producer.send({ kind: "WasmReturn", fn_kind: 0, fn_index: 1 });
+
+  await sleep(DEFAULT_FLUSH_INTERVAL_MS * 4);
+  assert.equal(
+    socket.arrivals.length,
+    0,
+    "a count-only policy holds a sub-threshold batch to the end of the session",
+  );
+
+  producer.close();
+  assert.equal(socket.arrivals.length, 1, "the batch leaves at close, and only then");
+  assert.ok(socket.arrivals[0].at <= socket.closedAt);
+});
+
+test("an explicit flushThreshold is still honoured exactly", async () => {
+  // The time bound is added ALONGSIDE the count bound, not in place of it: a
+  // page that asks for a frame every event still gets one.
+  const socket = new TimingSocket();
+  const producer = createWebSocketProducer({
+    endpoint: "ws://test/ct-stream",
+    transportFactory: () => socket,
+    flushThreshold: 1,
+  });
+  producer.send({ kind: "WasmCall", fn_kind: 0, fn_index: 1 });
+  assert.equal(socket.arrivals.length, 1, "threshold 1 ships synchronously");
+  producer.send({ kind: "WasmReturn", fn_kind: 0, fn_index: 1 });
+  assert.equal(socket.arrivals.length, 2);
+
+  // And a count-driven flush must cancel the deadline it satisfied, rather
+  // than leaving a timer to ship an empty frame later.
+  await sleep(DEFAULT_FLUSH_INTERVAL_MS * 4);
+  assert.equal(
+    socket.arrivals.length,
+    2,
+    "a satisfied deadline must not fire a spurious empty frame",
+  );
+  producer.close();
+});
+
+test("the deadline runs from a batch's first event, not its last", async () => {
+  // A steady dribble of events must not be able to postpone its own delivery.
+  // Re-arming on every `send` would let a page emitting one event every 10ms
+  // hold the batch indefinitely against a 50ms interval.
+  const socket = new TimingSocket();
+  const producer = createWebSocketProducer({
+    endpoint: "ws://test/ct-stream",
+    transportFactory: () => socket,
+    flushIntervalMs: 40,
+  });
+  for (let i = 0; i < 8; i++) {
+    producer.send({ kind: "WasmCall", fn_kind: 0, fn_index: i });
+    await sleep(10);
+  }
+  assert.ok(
+    socket.arrivals.length >= 1,
+    "the first batch must have left despite events still arriving",
+  );
+  producer.close();
 });

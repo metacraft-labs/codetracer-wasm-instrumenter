@@ -177,6 +177,13 @@ export function boundaryBindingName(label, role, slot) {
  *   mirrored JS-side markers. Defaults to `globalThis.__ct`.
  * @property {(url: string) => any} [transportFactory] Test seam.
  * @property {number} [flushThreshold] Events buffered before a flush.
+ *   Defaults to `DEFAULT_FLUSH_THRESHOLD` in `host_runtime.js`.
+ * @property {number} [flushIntervalMs] Milliseconds an event may wait
+ *   before it is shipped regardless of how full the buffer is. Defaults
+ *   to `DEFAULT_FLUSH_INTERVAL_MS`; `0` disables the time-based flush.
+ *   The two bounds together are what make a short page's recording reach
+ *   the daemon *during* the run rather than in one batch at `stop()`
+ *   (M38d) — see `host_runtime.js` for the reasoning.
  * @property {Record<string, string>} [returnValueNames] Per-export
  *   override of the binding an origin chain resumes on when it crosses
  *   *into* this recording.
@@ -262,6 +269,7 @@ export function createBrowserWasmRecorder(options = {}) {
     endpoint,
     transportFactory: options.transportFactory,
     flushThreshold: options.flushThreshold,
+    flushIntervalMs: options.flushIntervalMs,
   });
 
   let stopped = false;
