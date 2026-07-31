@@ -426,18 +426,25 @@ struct HookFunctionIds {
     correlation_token: FunctionId,
     emit_i32: FunctionId,
     emit_i64: FunctionId,
-    emit_f32: FunctionId,
-    emit_f64: FunctionId,
+    emit_f32_bits: FunctionId,
+    emit_f64_bits: FunctionId,
 }
 
 impl HookFunctionIds {
-    /// The hook that transports one value of `ty`.
-    fn value_hook(&self, ty: ScalarType) -> FunctionId {
+    /// The hook that transports one value of `ty`, and the
+    /// reinterpretation the module must apply before calling it.
+    ///
+    /// Floats travel as their integer bit pattern (M52): the module
+    /// does the `reinterpret` itself so no float ever crosses into the
+    /// host, where a JavaScript embedder's `Number` conversion would
+    /// leave a NaN's payload implementation-defined. See `hooks.rs`,
+    /// "Why the float hooks carry integers".
+    fn value_hook(&self, ty: ScalarType) -> (FunctionId, Option<UnaryOp>) {
         match ty {
-            ScalarType::I32 => self.emit_i32,
-            ScalarType::I64 => self.emit_i64,
-            ScalarType::F32 => self.emit_f32,
-            ScalarType::F64 => self.emit_f64,
+            ScalarType::I32 => (self.emit_i32, None),
+            ScalarType::I64 => (self.emit_i64, None),
+            ScalarType::F32 => (self.emit_f32_bits, Some(UnaryOp::I32ReinterpretF32)),
+            ScalarType::F64 => (self.emit_f64_bits, Some(UnaryOp::I64ReinterpretF64)),
         }
     }
 
@@ -484,8 +491,11 @@ impl HookFunctionIds {
         };
         let emit_i32 = value_hook(hooks::HOOK_EMIT_I32, ValType::I32);
         let emit_i64 = value_hook(hooks::HOOK_EMIT_I64, ValType::I64);
-        let emit_f32 = value_hook(hooks::HOOK_EMIT_F32, ValType::F32);
-        let emit_f64 = value_hook(hooks::HOOK_EMIT_F64, ValType::F64);
+        // The float hooks take the value's *bit pattern*, not the
+        // float — see `hooks.rs`, "Why the float hooks carry integers
+        // (M52)". The reinterpret happens inside the module.
+        let emit_f32_bits = value_hook(hooks::HOOK_EMIT_F32_BITS, ValType::I32);
+        let emit_f64_bits = value_hook(hooks::HOOK_EMIT_F64_BITS, ValType::I64);
 
         HookFunctionIds {
             emit_call,
@@ -494,8 +504,8 @@ impl HookFunctionIds {
             correlation_token,
             emit_i32,
             emit_i64,
-            emit_f32,
-            emit_f64,
+            emit_f32_bits,
+            emit_f64_bits,
         }
     }
 }
@@ -596,7 +606,14 @@ fn push_value_capture_group(
     }
 }
 
-/// `i32.const slot; local.get value; call __ct_emit_<ty>`.
+/// `i32.const slot; local.get value; [reinterpret;] call __ct_emit_<ty>`.
+///
+/// The optional reinterpret is what makes a float boundary value exact
+/// on a JavaScript host (M52): `f32`/`f64` become `i32`/`i64` here, in
+/// the module, so the host is handed a bit pattern rather than a number
+/// it might not be able to represent. The spill local keeps its float
+/// type — the operand is pushed back unchanged, so the module under
+/// observation computes exactly as it did before.
 fn push_value_emit(
     out: &mut Vec<(Instr, walrus::ir::InstrLocId)>,
     loc: walrus::ir::InstrLocId,
@@ -605,6 +622,7 @@ fn push_value_emit(
     local: LocalId,
     ty: ScalarType,
 ) {
+    let (func, reinterpret) = hook_ids.value_hook(ty);
     out.push((
         Instr::Const(walrus::ir::Const {
             value: walrus::ir::Value::I32(slot),
@@ -612,12 +630,10 @@ fn push_value_emit(
         loc,
     ));
     out.push((Instr::LocalGet(walrus::ir::LocalGet { local }), loc));
-    out.push((
-        Instr::Call(walrus::ir::Call {
-            func: hook_ids.value_hook(ty),
-        }),
-        loc,
-    ));
+    if let Some(op) = reinterpret {
+        out.push((Instr::Unop(walrus::ir::Unop { op }), loc));
+    }
+    out.push((Instr::Call(walrus::ir::Call { func }), loc));
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,8 +1937,8 @@ mod tests {
                 [
                     hooks::HOOK_EMIT_I32,
                     hooks::HOOK_EMIT_I64,
-                    hooks::HOOK_EMIT_F32,
-                    hooks::HOOK_EMIT_F64,
+                    hooks::HOOK_EMIT_F32_BITS,
+                    hooks::HOOK_EMIT_F64_BITS,
                 ]
                 .contains(&i.name.as_str())
             })

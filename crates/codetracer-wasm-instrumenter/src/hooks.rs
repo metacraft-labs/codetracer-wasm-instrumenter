@@ -15,8 +15,8 @@
 //! | [`HOOK_CORRELATION_TOKEN`] | `() -> i64` |
 //! | [`HOOK_EMIT_I32`] | `(slot: i32, value: i32) -> ()` |
 //! | [`HOOK_EMIT_I64`] | `(slot: i32, value: i64) -> ()` |
-//! | [`HOOK_EMIT_F32`] | `(slot: i32, value: f32) -> ()` |
-//! | [`HOOK_EMIT_F64`] | `(slot: i32, value: f64) -> ()` |
+//! | [`HOOK_EMIT_F32_BITS`] | `(slot: i32, bits: i32) -> ()` |
+//! | [`HOOK_EMIT_F64_BITS`] | `(slot: i32, bits: i64) -> ()` |
 //!
 //! The value hooks are typed rather than universal because WASM has
 //! no polymorphic call: a single `(slot, value)` hook would have to
@@ -26,6 +26,33 @@
 //! payload mismatch a replay *divergence* — so the lossy hook would
 //! turn a recording into something that cannot be replayed. One hook
 //! per value type keeps every boundary value exact.
+//!
+//! # Why the float hooks carry integers (M52)
+//!
+//! Typing the float hooks `f32` / `f64` was necessary but not
+//! sufficient: it makes the *WebAssembly* value exact, and then hands
+//! it to a host that may not be able to hold it. A JavaScript embedder
+//! receives a WASM `f32`/`f64` parameter as a `Number`, and the
+//! WebAssembly JS API leaves a NaN's payload implementation-defined
+//! across that conversion — so a module computing with a signalling
+//! NaN or a payload-carrying quiet NaN handed the browser a *different*
+//! NaN than it produced. `JSON.stringify` then rendered it `null`,
+//! and `-0.0` rendered `0`. Spec § 7 makes a payload mismatch a
+//! divergence, so the recording was not a faithful re-execution input.
+//!
+//! The fix is producer-first, the same move M39 made: the module
+//! reinterprets the float to its integer bit pattern *before* the call
+//! ([`walrus::ir::UnaryOp::I32ReinterpretF32`] /
+//! `I64ReinterpretF64`), so no float ever crosses into the host and
+//! there is no conversion to be lossy. The host reassembles the value
+//! from bits it received exactly.
+//!
+//! [`HOOK_EMIT_F32_LEGACY`] and [`HOOK_EMIT_F64_LEGACY`] are the
+//! pre-M52 spelling.
+//! Nothing emits them any more, but they remain named here and hosts
+//! are expected to keep serving them, because a module instrumented by
+//! an older pipeline is an artefact users hold: it still imports them
+//! and must still load.
 //!
 //! # Emission order (the framing contract)
 //!
@@ -102,15 +129,32 @@ pub const HOOK_EMIT_I32: &str = "__ct_emit_i32";
 /// argument or result; `slot` is the position within its tuple.
 pub const HOOK_EMIT_I64: &str = "__ct_emit_i64";
 
-/// `__ct_emit_f32(slot: i32, value: f32)`. One per `f32` boundary
-/// argument or result. The value is passed as an `f32` — not widened
-/// to `f64` — so signalling-NaN payloads and `-0.0` survive
-/// unchanged (spec § 7).
-pub const HOOK_EMIT_F32: &str = "__ct_emit_f32";
+/// `__ct_emit_f32_bits(slot: i32, bits: i32)`. One per `f32` boundary
+/// argument or result; `bits` is the value's IEEE-754 encoding,
+/// produced in-module by `i32.reinterpret_f32`.
+///
+/// The parameter is an `i32` and not an `f32` on purpose — see the
+/// module docs, "Why the float hooks carry integers (M52)". A host
+/// that wants the number back does
+/// `Float32Array`/`Int32Array`-style reinterpretation of its own; a
+/// host that only needs to *record* it should store the bits, which
+/// is the only lossless thing to do with a NaN.
+pub const HOOK_EMIT_F32_BITS: &str = "__ct_emit_f32_bits";
 
-/// `__ct_emit_f64(slot: i32, value: f64)`. One per `f64` boundary
-/// argument or result.
-pub const HOOK_EMIT_F64: &str = "__ct_emit_f64";
+/// `__ct_emit_f64_bits(slot: i32, bits: i64)`. One per `f64` boundary
+/// argument or result; `bits` is the value's IEEE-754 encoding,
+/// produced in-module by `i64.reinterpret_f64`.
+pub const HOOK_EMIT_F64_BITS: &str = "__ct_emit_f64_bits";
+
+/// `__ct_emit_f32(slot: i32, value: f32)`. **Pre-M52 spelling; nothing
+/// emits it.** Retained so a host can keep serving modules instrumented
+/// by an older pipeline, which import it and would otherwise fail to
+/// instantiate.
+pub const HOOK_EMIT_F32_LEGACY: &str = "__ct_emit_f32";
+
+/// `__ct_emit_f64(slot: i32, value: f64)`. **Pre-M52 spelling; nothing
+/// emits it.** See [`HOOK_EMIT_F32_LEGACY`].
+pub const HOOK_EMIT_F64_LEGACY: &str = "__ct_emit_f64";
 
 /// `fn_kind` for a call *out* of the module into an imported host
 /// function.
@@ -151,9 +195,14 @@ pub const ALL_HOOKS: &[&str] = &[
     HOOK_CORRELATION_TOKEN,
     HOOK_EMIT_I32,
     HOOK_EMIT_I64,
-    HOOK_EMIT_F32,
-    HOOK_EMIT_F64,
+    HOOK_EMIT_F32_BITS,
+    HOOK_EMIT_F64_BITS,
 ];
+
+/// Hook names an instrumented module may import that are no longer
+/// emitted, but that a host must still be able to serve so older
+/// artefacts keep loading (M52's back-compat half).
+pub const LEGACY_HOOKS: &[&str] = &[HOOK_EMIT_F32_LEGACY, HOOK_EMIT_F64_LEGACY];
 
 /// Name of the custom section the instrumenter adds to every
 /// instrumented module. Read by the bundler plugins to short-

@@ -882,6 +882,60 @@ export function createBrowserWasmRecorder(options = {}) {
   }
 
   /**
+   * Buffer one boundary float, from its IEEE-754 bit pattern.
+   *
+   * **This is M52's whole mechanism on the recording side.** A WASM
+   * `f32`/`f64` parameter reaches JS as a `Number`, and the
+   * WebAssembly JS API leaves a NaN's payload implementation-defined
+   * across that conversion, so a module computing with a signalling
+   * NaN or a payload-carrying quiet NaN handed us a *different* NaN
+   * than it produced. `JSON.stringify` then made it worse: a `Number`
+   * NaN serialises as `null` and `-0` as `0`, so the two values the
+   * spec cares most about did not merely lose precision, they left the
+   * recording undecodable or silently wrong. Spec § 7 classes a NaN
+   * payload mismatch as a replay divergence, so such a recording was
+   * not a faithful re-execution input.
+   *
+   * The instrumented module now reinterprets the float to an integer
+   * before the call (`i32.reinterpret_f32` / `i64.reinterpret_f64`),
+   * so nothing crosses this boundary that a `Number` could damage.
+   *
+   * The recorded spelling is `f32:0x<8 hex>` / `f64:0x<16 hex>` under
+   * the `Float` type kind. Three things make that the right shape:
+   *
+   *   * It is a *string*, so it survives `JSON.stringify` intact where
+   *     a `Number` NaN would not, and survives
+   *     `browser_stream_host.rs::translate_value`, which passes a
+   *     string value through verbatim.
+   *   * It keeps `typeKind: "Float"`, so the value still lands on disk
+   *     as a `ValueRecord::Float` and nothing downstream that switches
+   *     on the kind has to learn a new variant.
+   *   * It is self-describing and width-tagged, so a decoder can tell
+   *     it apart from the pre-M52 decimal spelling without a flag day
+   *     — which is what lets recordings already in users' hands keep
+   *     decoding. See `decode` in
+   *     `codetracer-wasm-recorder/internal/boundarylog/values.go`.
+   *
+   * @param {number} slot
+   * @param {number} bits the value's bit pattern
+   * @param {number} width 32 or 64
+   */
+  function recordFloatBits(slot, bits, width) {
+    if (stopped) return;
+    // `BigInt.asUintN` normalises the sign: an i32 hook parameter
+    // arrives as a signed Number and an i64 as a signed BigInt, but a
+    // bit pattern is unsigned.
+    const nibbles = width / 4;
+    const unsigned = BigInt.asUintN(width, BigInt(bits));
+    const hex = unsigned.toString(16).padStart(nibbles, "0");
+    pendingValues.push({
+      slot: slot | 0,
+      value: `f${width}:0x${hex}`,
+      typeKind: "Float",
+    });
+  }
+
+  /**
    * Emit the buffered run as bindings of `frame` and return it.
    *
    * A `FUNC_KIND_STORE` group is dropped without a trace, which is
@@ -944,6 +998,9 @@ export function createBrowserWasmRecorder(options = {}) {
        * One hook per WASM value type, because WASM has no polymorphic
        * call and widening `f32` would not preserve NaN payloads. Each
        * carries its position within the tuple it belongs to.
+       *
+       * The float hooks take a bit pattern rather than a float (M52) —
+       * see `recordFloatBits` for why, and for the recorded spelling.
        */
       __ct_emit_i32(slot, value) {
         recordValue(slot, value | 0, "Int");
@@ -951,6 +1008,20 @@ export function createBrowserWasmRecorder(options = {}) {
       __ct_emit_i64(slot, value) {
         recordValue(slot, value, "Int");
       },
+      __ct_emit_f32_bits(slot, bits) {
+        recordFloatBits(slot, bits, 32);
+      },
+      __ct_emit_f64_bits(slot, bits) {
+        recordFloatBits(slot, bits, 64);
+      },
+
+      /**
+       * Pre-M52 float hooks. Nothing emits them; they stay so a module
+       * instrumented by an older pipeline still instantiates against
+       * this session, and they record what that ABI can carry — which
+       * is every float except a NaN payload and the sign of `-0.0`.
+       * The limit belongs to the artefact, not to this host.
+       */
       __ct_emit_f32(slot, value) {
         recordValue(slot, value, "Float");
       },

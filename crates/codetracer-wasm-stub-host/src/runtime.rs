@@ -334,19 +334,62 @@ fn define_hooks(
     );
     linker.define(host, hooks::HOOK_CORRELATION_TOKEN, token)?;
 
-    for (name, ty) in [
-        (hooks::HOOK_EMIT_I32, ValueType::I32),
-        (hooks::HOOK_EMIT_I64, ValueType::I64),
-        (hooks::HOOK_EMIT_F32, ValueType::F32),
-        (hooks::HOOK_EMIT_F64, ValueType::F64),
+    // How the harness reads a value hook's second parameter back into a
+    // `RecordedValue`.
+    //
+    // Since M52 the float hooks carry an *integer bit pattern* rather
+    // than a float: the module reinterprets before the call so no float
+    // ever crosses into the host. That is invisible here — wasmi holds
+    // both exactly — but it is the whole mechanism on a JavaScript host,
+    // and the harness has to speak the same ABI as the browser or the
+    // parity tests would be comparing two different contracts.
+    #[derive(Clone, Copy)]
+    enum Reading {
+        /// Take the parameter at face value.
+        Native,
+        /// The parameter is an `i32` holding an `f32`'s bit pattern.
+        F32FromI32Bits,
+        /// The parameter is an `i64` holding an `f64`'s bit pattern.
+        F64FromI64Bits,
+    }
+
+    // Both the current and the pre-M52 float spellings are served.
+    // An instrumented `.wasm` is an artefact users hold: one produced by
+    // an older pipeline imports `__ct_emit_f32` / `__ct_emit_f64` and
+    // must still instantiate. Serving both is also what lets a test
+    // record the SAME module through both ABIs and show that only the
+    // new one keeps a NaN payload.
+    for (name, ty, reading) in [
+        (hooks::HOOK_EMIT_I32, ValueType::I32, Reading::Native),
+        (hooks::HOOK_EMIT_I64, ValueType::I64, Reading::Native),
+        (
+            hooks::HOOK_EMIT_F32_BITS,
+            ValueType::I32,
+            Reading::F32FromI32Bits,
+        ),
+        (
+            hooks::HOOK_EMIT_F64_BITS,
+            ValueType::I64,
+            Reading::F64FromI64Bits,
+        ),
+        (hooks::HOOK_EMIT_F32_LEGACY, ValueType::F32, Reading::Native),
+        (hooks::HOOK_EMIT_F64_LEGACY, ValueType::F64, Reading::Native),
     ] {
         let sink = Arc::clone(events);
         let hook = Func::new(
             &mut *store,
             FuncType::new([ValueType::I32, ty], []),
             move |_caller, params, _results| {
-                let value = RecordedValue::from_wasmi(&params[1])
-                    .expect("value hooks only carry scalar types");
+                let value = match reading {
+                    Reading::Native => RecordedValue::from_wasmi(&params[1])
+                        .expect("value hooks only carry scalar types"),
+                    Reading::F32FromI32Bits => RecordedValue::F32Bits(
+                        params[1].i32().expect("f32 bits arrive as i32") as u32,
+                    ),
+                    Reading::F64FromI64Bits => RecordedValue::F64Bits(
+                        params[1].i64().expect("f64 bits arrive as i64") as u64,
+                    ),
+                };
                 sink.lock().expect("poisoned").push(RuntimeEvent::Value {
                     slot: params[0].i32().unwrap_or(0),
                     value,

@@ -98,7 +98,91 @@ test("an i64 boundary value is recorded exactly, not narrowed to a Number", () =
   assert.deepEqual(ret.returnValue, { value: "-1", typeKind: "BigInt" });
 });
 
-test("i32, f32 and f64 boundary values keep their existing encodings", () => {
+test("a boundary float is recorded as its exact bit pattern (M52)", () => {
+  // The three values the JS `Number` path could not carry, and the
+  // reason M52 exists.  All are reported through the bit hooks, so
+  // nothing here goes anywhere near a float-to-Number conversion.
+  const { r, transport } = recorder();
+  r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
+  // f32 signalling NaN: 0x7F800001 — the top payload bit clear, so
+  // widening to f64 and back, or any quieting, changes it.
+  r.imports.__ct_emit_f32_bits(0, 0x7f800001 | 0);
+  // f64 quiet NaN carrying a payload: 0x7FF80000DEADBEEF.
+  r.imports.__ct_emit_f64_bits(1, BigInt.asIntN(64, 0x7ff80000deadbeefn));
+  // -0.0 as f64 (0x8000000000000000) and as f32 (0x80000000).
+  r.imports.__ct_emit_f64_bits(2, BigInt.asIntN(64, 0x8000000000000000n));
+  r.imports.__ct_emit_f32_bits(3, 0x80000000 | 0);
+  // An ordinary finite float, to show the spelling is uniform rather
+  // than a special case reserved for the pathological values.
+  r.imports.__ct_emit_f32_bits(4, 0x3fc00000 | 0); // 1.5f
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  r.imports.__ct_emit_return(FUNC_KIND_EXPORT, 0);
+  r.stop();
+
+  const values = transport.lines().filter((l) => l.kind === "Value");
+  assert.deepEqual(
+    values.map((v) => v.value),
+    [
+      { value: "f32:0x7f800001", typeKind: "Float" },
+      { value: "f64:0x7ff80000deadbeef", typeKind: "Float" },
+      { value: "f64:0x8000000000000000", typeKind: "Float" },
+      { value: "f32:0x80000000", typeKind: "Float" },
+      { value: "f32:0x3fc00000", typeKind: "Float" },
+    ],
+  );
+});
+
+test("the pre-M52 float encoding is what it could not carry", () => {
+  // The negative control for the test above, and the reason the ABI
+  // had to change rather than the encoding alone.  Driven through the
+  // legacy hooks, which are still served so older instrumented modules
+  // load — a NaN reaching them has already been through the
+  // WebAssembly JS API's `Number` conversion, and `JSON.stringify`
+  // finishes the job.
+  const { r, transport } = recorder();
+  r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
+  r.imports.__ct_emit_f32(0, NaN);
+  r.imports.__ct_emit_f64(1, -0);
+  r.imports.__ct_emit_realm_boundary(
+    REALM_DIRECTION_ENTER,
+    FUNC_KIND_EXPORT,
+    0,
+    r.imports.__ct_correlation_token(),
+  );
+  r.imports.__ct_emit_return(FUNC_KIND_EXPORT, 0);
+  r.stop();
+
+  const values = transport.lines().filter((l) => l.kind === "Value");
+  // The NaN is on the wire as `null` — JSON has no NaN, so the payload
+  // is not merely canonicalised, the value is gone.  The negative zero
+  // reaches the wire as `0`, its sign lost.  Neither is recoverable by
+  // a reader; only the producer could have kept them, which is what
+  // M52 made it do.
+  assert.deepEqual(
+    values.map((v) => v.value),
+    [
+      { value: null, typeKind: "Float" },
+      { value: 0, typeKind: "Float" },
+    ],
+  );
+  // `transport.lines()` is what came off the wire, so these have
+  // already been through `JSON.stringify` — which is where the loss
+  // becomes irreversible.  Neither can be recovered by any reader:
+  // only the producer could have kept them, which is what M52 made it
+  // do.
+  assert.ok(
+    Object.is(values[1].value.value, 0) && !Object.is(values[1].value.value, -0),
+    "the sign of -0 must be gone on the pre-M52 path, or this is not the " +
+      "negative control it claims to be",
+  );
+});
+
+test("i32 and legacy f32/f64 boundary values keep their existing encodings", () => {
   const { r, transport } = recorder();
   r.imports.__ct_emit_call(FUNC_KIND_EXPORT, 0);
   r.imports.__ct_emit_i32(0, -7);

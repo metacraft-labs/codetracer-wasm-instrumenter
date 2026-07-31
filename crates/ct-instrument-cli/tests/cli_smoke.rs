@@ -79,8 +79,12 @@ fn test_wasm_instrumenter_cli_produces_valid_module() {
         "__ct_correlation_token",
         "__ct_emit_i32",
         "__ct_emit_i64",
-        "__ct_emit_f32",
-        "__ct_emit_f64",
+        // M52: floats cross as their integer bit pattern, so a
+        // JavaScript host never performs a lossy `Number` conversion
+        // on a NaN payload.  See `hooks.rs`, "Why the float hooks
+        // carry integers".
+        "__ct_emit_f32_bits",
+        "__ct_emit_f64_bits",
     ] {
         assert!(
             hooks_seen.contains(expected),

@@ -347,18 +347,25 @@ export function createWebSocketProducer(options = {}) {
  * that round-tripped through a JS number would be a recording the
  * replayer must reject.
  *
- * Known limit of a *JavaScript* host: WASM hands `f32` and `f64` to JS
- * as a `Number`, and the WebAssembly JS API leaves NaN payloads
- * implementation-defined across that conversion. So the bits recorded
- * here are exact for every finite value, for infinities and for
- * negative zero, but a signalling-NaN payload may already have been
- * canonicalised before this function sees it. That is a property of
- * the JS boundary, not of the instrumentation — a host that reads the
- * values without going through a `Number` (the wazero replayer, or the
- * `wasmi`-based test harness in `codetracer-wasm-stub-host`) sees them
- * bit-exact. A recording made in a browser from a module that computes
- * with NaN payloads is therefore not replay-safe under § 7, and the
- * replayer's divergence check is what will say so.
+ * This used to carry a known limit, and M52 removed it. WASM hands an
+ * `f32`/`f64` *parameter* to JS as a `Number`, and the WebAssembly JS
+ * API leaves a NaN's payload implementation-defined across that
+ * conversion — so a signalling NaN or a payload-carrying quiet NaN was
+ * already canonicalised before this function could see it, and a
+ * browser recording of such a module was not replay-safe under § 7.
+ *
+ * The float hooks no longer take a float. `__ct_emit_f32_bits` takes an
+ * `i32` and `__ct_emit_f64_bits` an `i64`, and the instrumented module
+ * reinterprets the value itself before the call, so nothing crosses the
+ * JS boundary that a `Number` could damage. Every boundary float is now
+ * exact here — finite values, both infinities, both signed zeros, and
+ * every NaN payload — on a browser host as on the `wasmi` harness and
+ * the wazero replayer.
+ *
+ * `__ct_emit_f32` / `__ct_emit_f64` remain implemented below. Nothing
+ * emits them, but a module instrumented by a pre-M52 pipeline imports
+ * them and must still instantiate; served that way it carries the old
+ * limit, which is a property of that artefact rather than of this host.
  *
  * When a `producer` (or `endpoint`) is supplied, the runtime
  * also translates each event into its JSON shape and ships it
@@ -454,6 +461,11 @@ export function createRecorderRuntime(options = {}) {
        * Boundary value hooks (spec § 5). One per WASM value type,
        * because a single hook would have to widen `f32`, which is not
        * bit-preserving for signalling NaNs.
+       *
+       * The float hooks take the value's bit pattern, not the value:
+       * see the note on NaN payloads in `createRecorderRuntime`'s
+       * docstring. The binary slot format already stored bits, so
+       * this changes what reaches JS, not what is written.
        */
       __ct_emit_i32(slot, value) {
         recordValue(0, slot, BigInt(value >>> 0));
@@ -461,6 +473,20 @@ export function createRecorderRuntime(options = {}) {
       __ct_emit_i64(slot, value) {
         recordValue(1, slot, asBigInt(value));
       },
+      __ct_emit_f32_bits(slot, bits) {
+        recordValue(2, slot, BigInt(bits >>> 0));
+      },
+      __ct_emit_f64_bits(slot, bits) {
+        recordValue(3, slot, BigInt.asUintN(64, asBigInt(bits)));
+      },
+
+      /**
+       * Pre-M52 float hooks. Nothing emits them; they stay so a module
+       * instrumented by an older pipeline still instantiates against
+       * this runtime. A NaN reaching them has already lost its payload
+       * to the `Number` conversion — that is the limit M52 removed and
+       * this arm preserves only for the sake of old artefacts.
+       */
       __ct_emit_f32(slot, value) {
         recordValue(2, slot, BigInt(f32Bits(value)));
       },
