@@ -28,7 +28,13 @@ test: test-rust
 
 # Whole-workspace cargo test run (unit tests + the `verification`,
 # `parity`, `cli_smoke`, `boundary_values`, `boundary_decode`,
-# `factory_logs_all_calls` and `stylus_parity` integration suites).
+# `exception_handling`, `factory_logs_all_calls` and `stylus_parity`
+# integration suites).
+#
+# `exception_handling` executes its modules under the host V8 through
+# `node`, because `wasmi` cannot enable the exceptions proposal. `node`
+# comes from this repo's own flake, so the suite is self-contained from
+# inside the dev shell.
 test-rust:
     cargo test --workspace --locked
 

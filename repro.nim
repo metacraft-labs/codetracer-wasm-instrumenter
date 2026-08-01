@@ -53,6 +53,17 @@
 ##   * ``codetracer-wasm-host-module-framework/tests/{factory_logs_all_calls,
 ##     stylus_parity}.rs`` exercise the TOML-driven plan formatter over
 ##     in-repo config fixtures.
+##   * ``codetracer-wasm-instrumenter/tests/exception_handling.rs`` shells
+##     out to ``node`` (M35c). It is portable in the same sense as the
+##     rest: ``node`` is supplied by this repo's own ``flake.nix``
+##     (``nodejs_22``), exactly as it already is for ``just test-runtime``
+##     and ``just test-plugins``, so this adds no NEW toolchain floor
+##     beyond what those recipes already require — it only moves a node
+##     dependency into the ``cargo test`` edge. It carries no ``#[ignore]``
+##     and no skip arm: without ``node`` the suite FAILS, deliberately,
+##     because a silently skipped oracle is how the gap it covers survived
+##     two milestones. The reason it cannot use the in-process ``wasmi``
+##     embedder is that ``wasmi`` 0.31 hard-codes ``exceptions: false``.
 ##
 ## The four ``parity.rs`` tests read golden ``.wasm`` fixtures from the
 ## sibling ``../codetracer-wasm-recorder/cmd/wazero/testdata/recorder-golden/``

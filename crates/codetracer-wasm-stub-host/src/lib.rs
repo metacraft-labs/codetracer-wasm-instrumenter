@@ -15,6 +15,13 @@
 //!    un-instrumented module, so a test can assert the two computed
 //!    the same thing.
 //!
+//! 1c. [`v8::run_module_under_v8`]: the same thing again, under V8 via
+//!    `node`, returning the same [`runtime::RuntimeRecording`]. It
+//!    exists because `wasmi` 0.31 cannot enable the exception-handling
+//!    proposal at all, which left every `-fwasm-exceptions` module
+//!    outside the reach of the oracle until M35c. Prefer `wasmi` for
+//!    anything it can run; reach for V8 for exceptions and GC.
+//!
 //! 2. [`record_interpreter`]: walks the *original* (un-instrumented)
 //!    module and synthesises the event stream that the existing
 //!    interpreter-based recorders (`codetracer-wasm-recorder/`,
@@ -39,6 +46,7 @@ use walrus::ir::{Instr, InstrSeqId};
 use walrus::{FunctionId, Module};
 
 pub mod runtime;
+pub mod v8;
 
 pub use runtime::{
     boundary_frames, frames_for, run_module, BoundaryFrame, ImportStub, RecordedValue,
@@ -312,19 +320,48 @@ fn walk_block_instrumented(
             }
         }
         // Recurse into nested blocks.
-        match instr {
-            Instr::Block(walrus::ir::Block { seq }) | Instr::Loop(walrus::ir::Loop { seq }) => {
-                walk_block_instrumented(lf, *seq, hook_ids, function, events);
-            }
-            Instr::IfElse(walrus::ir::IfElse {
-                consequent,
-                alternative,
-            }) => {
-                walk_block_instrumented(lf, *consequent, hook_ids, function, events);
-                walk_block_instrumented(lf, *alternative, hook_ids, function, events);
-            }
-            _ => {}
+        for seq in nested_sequences(instr) {
+            walk_block_instrumented(lf, seq, hook_ids, function, events);
         }
+    }
+}
+
+/// Every instruction sequence `instr` *owns*, in the order they
+/// execute.
+///
+/// The counterpart of the instrumenter's `collect_block_ids`, and it
+/// has to stay in step with it: this crate's job is to say what an
+/// embedder would have observed, so a sequence it does not walk is a
+/// sequence it under-reports — the same failure that left
+/// exception-handling bodies uninstrumented until M35c.
+///
+/// Both exception-handling proposals are covered. A `try_table`'s
+/// catch clauses are *labels*, not owned sequences, so they are
+/// deliberately absent; a legacy `try`'s `catch` / `catch_all`
+/// handlers really are owned sequences and are included, while
+/// `delegate` carries a relative depth and owns nothing.
+fn nested_sequences(instr: &Instr) -> Vec<InstrSeqId> {
+    match instr {
+        Instr::Block(walrus::ir::Block { seq }) | Instr::Loop(walrus::ir::Loop { seq }) => {
+            vec![*seq]
+        }
+        Instr::IfElse(walrus::ir::IfElse {
+            consequent,
+            alternative,
+        }) => vec![*consequent, *alternative],
+        Instr::TryTable(walrus::ir::TryTable { seq, .. }) => vec![*seq],
+        Instr::Try(walrus::ir::Try { seq, catches }) => {
+            let mut out = vec![*seq];
+            for catch in catches {
+                match catch {
+                    walrus::ir::LegacyCatch::Catch { handler, .. }
+                    | walrus::ir::LegacyCatch::CatchAll { handler } => out.push(*handler),
+                    walrus::ir::LegacyCatch::Delegate { .. } => {}
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -394,17 +431,10 @@ fn walk_block_oracle(
                     push_call_pair_leave(events, 0, *import_index);
                 }
             }
-            Instr::Block(walrus::ir::Block { seq }) | Instr::Loop(walrus::ir::Loop { seq }) => {
-                walk_block_oracle(lf, *seq, imported_index, function, events);
-            }
-            Instr::IfElse(walrus::ir::IfElse {
-                consequent,
-                alternative,
-            }) => {
-                walk_block_oracle(lf, *consequent, imported_index, function, events);
-                walk_block_oracle(lf, *alternative, imported_index, function, events);
-            }
             _ => {}
+        }
+        for seq in nested_sequences(instr) {
+            walk_block_oracle(lf, seq, imported_index, function, events);
         }
     }
 }

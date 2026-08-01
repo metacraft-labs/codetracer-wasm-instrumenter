@@ -85,36 +85,47 @@
 //!   the module is **rejected** with a diagnostic naming the
 //!   function rather than recorded with a hole in its value stream
 //!   (spec § 8).
-//! - **Exception-handling and GC instruction sequences are not walked
-//!   at all.** `collect_block_ids` descends into `block`, `loop` and
-//!   `if`/`else` only, so nothing inside a `try_table` body or a
-//!   catch clause is seen by any pass here. Two consequences, and the
-//!   second is the larger one. First, a label-carrying instruction of
-//!   those proposals (`br_on_cast`, `br_on_null`, a `try_table` catch
-//!   clause, …) is not recognised as an exit when it names the
-//!   function's own label. Second, an ordinary explicit `return`
-//!   nested inside a `try_table` body is **not wrapped either**, so
-//!   that exit emits no leave event and no result capture even though
-//!   it is not an exotic exit shape at all.
-//!   As with every gap here the consequence is a *missing* record,
-//!   never a wrong one — the exit still leaves the function with the
-//!   same values, and the computation is untouched. There is no test
-//!   coverage for these modules, and the `wasmi`-backed parity oracle
-//!   cannot supply any: its engine is built without the exceptions
-//!   proposal, so it refuses such a module outright.
+//! - **An exception that unwinds *past* an open crossing leaves it
+//!   open.** The hook surface has no "on unwind" event, so if a
+//!   `throw` propagates out of an instrumented export, or out of an
+//!   imported call whose `__ct_emit_call` has already fired, the
+//!   matching `__ct_emit_return` and LEAVE never fire. This is
+//!   inherent to the surface, not to the walk — it is equally true of
+//!   a function that throws without using a `try_table` at all — and
+//!   the failure is loud rather than silent: the stream is left
+//!   structurally unbalanced, which a § 6 replayer refuses outright
+//!   rather than replaying past. Recording an unwind is a hook-surface
+//!   change and belongs to whichever milestone takes on replaying
+//!   exceptions.
 //!
-//! The exit-site coverage of the export edge is complete for
-//! MVP control flow as of M35b: the fall-through exit, an explicit
-//! `return`, and an exit taken by branching to the function's own
-//! label (`br` / `br_if` / `br_table`) all emit the leave event and
-//! the result capture. The last of those used to be a hole — an
-//! epilogue appended to the entry sequence is jumped clean over by a
-//! branch to the function label. It is closed by moving the body into
-//! an inner block typed `[] -> results` and re-pointing those branches
-//! at that block, so they land before the epilogue rather than after
-//! it; see `wrap_local_function_boundary`'s implementation. The
-//! restructuring is applied only to functions that actually contain
-//! such a branch.
+//! The exit-site coverage of the export edge is complete for MVP
+//! control flow as of M35b, and for the exception-handling and GC
+//! proposals as of M35c: the fall-through exit, an explicit `return`
+//! wherever it is nested, an exit taken by branching to the function's
+//! own label (`br` / `br_if` / `br_table`), the GC label-carrying
+//! forms (`br_on_null`, `br_on_non_null`, `br_on_cast`,
+//! `br_on_cast_fail`), and a `try_table` catch clause that names the
+//! function label all emit the leave event and the result capture.
+//!
+//! Two mechanisms do that work, and they are separate. Branching to
+//! the function's own label used to jump clean over an epilogue
+//! appended to the entry sequence; M35b closed it by moving the body
+//! into an inner block typed `[] -> results` and re-pointing those
+//! branches at that block, so they land before the epilogue rather
+//! than after it (see `wrap_local_function_boundary`, and
+//! `visit_branch_targets` for the set of forms that count as a
+//! branch). The restructuring is applied only to functions that
+//! actually contain such a branch, which is what keeps every other
+//! module byte-identical.
+//!
+//! Nesting is the other half. Until M35c the crate's single traversal,
+//! `collect_block_ids`, descended into `block` / `loop` / `if`-`else`
+//! and nothing else, so **nothing inside a `try_table` body, a legacy
+//! `try` body or a legacy catch handler was seen by any pass** — an
+//! ordinary explicit `return` there was not wrapped, and an imported
+//! call there was not captured, even though `try_table` is exactly
+//! what `-fwasm-exceptions` emits. `collect_block_ids` now descends
+//! into all of them.
 
 #![deny(rust_2018_idioms, unused_must_use)]
 #![warn(missing_docs)]
@@ -1545,6 +1556,44 @@ impl<'a> StoreRewriter<'a> {
     }
 }
 
+/// Every instruction sequence reachable from `root`, `root` included.
+///
+/// This is the one traversal the whole crate walks: every pass that
+/// has to find something *inside* a function — the explicit-`return`
+/// sites the export epilogue is spliced before, the imported-call
+/// sites, the store sites of the retired interior pass, and the
+/// branch-target scan the M35b restructuring is driven by — reaches
+/// its work through here. A sequence this function does not yield is
+/// a sequence no pass instruments, silently.
+///
+/// That is exactly how the exception-handling gap arose (M35, review
+/// of 2026-08-01): until M35c only `block` / `loop` / `if`-`else` were
+/// descended into, so a plain `return` inside a `try_table` body was
+/// never wrapped and the crossing it took never closed. The nesting
+/// forms of both exception-handling proposals are therefore descended
+/// into here as well:
+///
+/// - `try_table`'s body (`seq`). Its *catch clauses* are not nesting —
+///   a `TryTableCatch`'s `label` names an enclosing block, which makes
+///   it a branch target, so it is handled by [`visit_branch_targets`]
+///   instead.
+/// - the legacy `try`'s body (`seq`) **and** its `catch` / `catch_all`
+///   handler sequences, which unlike a `try_table` catch clause really
+///   are nested sequences owned by the instruction. A legacy
+///   `delegate` carries a relative depth rather than a sequence id and
+///   so has nothing to descend into.
+///
+/// GC adds no new *nesting* forms — `br_on_cast` and friends carry a
+/// label, not a body — so they need nothing here; they too are
+/// [`visit_branch_targets`]'s business.
+///
+/// The order of the returned ids is load-bearing in one narrow but
+/// important sense: it fixes the order the passes rewrite sequences
+/// in, and therefore the bytes they emit. The arms below are additive,
+/// so a function containing no exception-handling instruction yields
+/// exactly the sequence, in exactly the order, it yielded before —
+/// which is what keeps the rewrite byte-identical for every module
+/// that does not use these proposals.
 fn collect_block_ids(local_func: &walrus::LocalFunction, root: InstrSeqId) -> Vec<InstrSeqId> {
     let mut out = vec![root];
     let mut work = vec![root];
@@ -1563,6 +1612,27 @@ fn collect_block_ids(local_func: &walrus::LocalFunction, root: InstrSeqId) -> Ve
                     out.push(*alternative);
                     work.push(*consequent);
                     work.push(*alternative);
+                }
+                Instr::TryTable(walrus::ir::TryTable { seq, .. }) => {
+                    out.push(*seq);
+                    work.push(*seq);
+                }
+                Instr::Try(walrus::ir::Try { seq, catches }) => {
+                    out.push(*seq);
+                    work.push(*seq);
+                    for catch in catches {
+                        match catch {
+                            walrus::ir::LegacyCatch::Catch { handler, .. }
+                            | walrus::ir::LegacyCatch::CatchAll { handler } => {
+                                out.push(*handler);
+                                work.push(*handler);
+                            }
+                            // `delegate` re-throws to an enclosing
+                            // block by relative depth; there is no
+                            // handler sequence to walk.
+                            walrus::ir::LegacyCatch::Delegate { .. } => {}
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1917,22 +1987,46 @@ fn reroot_body_into_inner_block(module: &mut Module, target: FunctionId) {
 
 /// Apply `f` to every branch-target label `instr` carries.
 ///
-/// Only the three MVP branch forms are covered. The GC and
-/// exception-handling proposals add further label-carrying
-/// instructions (`br_on_cast`, a `try_table` catch clause, …); a
-/// module using those keeps the pre-M35b behaviour on that one exit —
-/// a *missing* record, never a wrong one, because a branch left
-/// pointing at the entry label still exits the function with the same
-/// values. Widening this to the GC forms is safe but unexercised, so
-/// it is left for the milestone that has fixtures for them.
+/// Every label-carrying form is covered, not just the three MVP
+/// branches: the GC proposal's `br_on_null` / `br_on_non_null` /
+/// `br_on_cast` / `br_on_cast_fail`, and a `try_table`'s catch
+/// clauses, whose `label` is a branch target in the enclosing scope
+/// rather than a nested handler. (The *legacy* `try`'s `catch`
+/// handlers are nested sequences, not labels — [`collect_block_ids`]
+/// descends into them; `delegate` carries a relative depth and no
+/// label at all.)
+///
+/// Two callers depend on this being exhaustive, and they fail
+/// differently if it is not. [`function_branches_to_entry`] would miss
+/// an exit and record it short; [`reroot_body_into_inner_block`] would
+/// leave a re-rooted branch pointing at the now-empty entry sequence.
+/// The substitution those two perform is type-safe for every form here
+/// because the entry and inner labels are given identical result
+/// types, so a branch that type-checked against one type-checks
+/// against the other whatever values it carries.
 fn visit_branch_targets(instr: &Instr, mut f: impl FnMut(&InstrSeqId)) {
     match instr {
-        Instr::Br(walrus::ir::Br { block }) | Instr::BrIf(walrus::ir::BrIf { block }) => f(block),
+        Instr::Br(walrus::ir::Br { block })
+        | Instr::BrIf(walrus::ir::BrIf { block })
+        | Instr::BrOnNull(walrus::ir::BrOnNull { block })
+        | Instr::BrOnNonNull(walrus::ir::BrOnNonNull { block })
+        | Instr::BrOnCast(walrus::ir::BrOnCast { block, .. })
+        | Instr::BrOnCastFail(walrus::ir::BrOnCastFail { block, .. }) => f(block),
         Instr::BrTable(walrus::ir::BrTable { blocks, default }) => {
             for block in blocks.iter() {
                 f(block);
             }
             f(default);
+        }
+        Instr::TryTable(walrus::ir::TryTable { catches, .. }) => {
+            for catch in catches {
+                match catch {
+                    walrus::ir::TryTableCatch::Catch { label, .. }
+                    | walrus::ir::TryTableCatch::CatchRef { label, .. }
+                    | walrus::ir::TryTableCatch::CatchAll { label }
+                    | walrus::ir::TryTableCatch::CatchAllRef { label } => f(label),
+                }
+            }
         }
         _ => {}
     }
@@ -1941,12 +2035,27 @@ fn visit_branch_targets(instr: &Instr, mut f: impl FnMut(&InstrSeqId)) {
 /// [`visit_branch_targets`], by mutable reference.
 fn visit_branch_targets_mut(instr: &mut Instr, mut f: impl FnMut(&mut InstrSeqId)) {
     match instr {
-        Instr::Br(walrus::ir::Br { block }) | Instr::BrIf(walrus::ir::BrIf { block }) => f(block),
+        Instr::Br(walrus::ir::Br { block })
+        | Instr::BrIf(walrus::ir::BrIf { block })
+        | Instr::BrOnNull(walrus::ir::BrOnNull { block })
+        | Instr::BrOnNonNull(walrus::ir::BrOnNonNull { block })
+        | Instr::BrOnCast(walrus::ir::BrOnCast { block, .. })
+        | Instr::BrOnCastFail(walrus::ir::BrOnCastFail { block, .. }) => f(block),
         Instr::BrTable(walrus::ir::BrTable { blocks, default }) => {
             for block in blocks.iter_mut() {
                 f(block);
             }
             f(default);
+        }
+        Instr::TryTable(walrus::ir::TryTable { catches, .. }) => {
+            for catch in catches.iter_mut() {
+                match catch {
+                    walrus::ir::TryTableCatch::Catch { label, .. }
+                    | walrus::ir::TryTableCatch::CatchRef { label, .. }
+                    | walrus::ir::TryTableCatch::CatchAll { label }
+                    | walrus::ir::TryTableCatch::CatchAllRef { label } => f(label),
+                }
+            }
         }
         _ => {}
     }

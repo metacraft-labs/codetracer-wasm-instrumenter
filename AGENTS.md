@@ -36,7 +36,7 @@ yourself needing a tool that is not in `flake.nix`, add it to `flake.nix`.
 | Command                        | What it does                                                     |
 | ------------------------------ | ---------------------------------------------------------------- |
 | `just build`                   | `cargo build --workspace --release --locked`                     |
-| `just test`                    | `cargo test --workspace --locked` — the whole suite (60 tests)    |
+| `just test`                    | `cargo test --workspace --locked` — the whole suite (72 tests)    |
 | `just test-plugins`            | `node --test` over the bundler plugin wrappers in `plugins/`      |
 | `just test-runtime`            | `node --test` over the shims in `recorder-runtime/`               |
 | `just lint`                    | `cargo clippy … -D warnings`, `cargo fmt --check`, `nixfmt --check` |
@@ -72,6 +72,13 @@ equivalence).
     number it pushed. The same entry point runs the un-instrumented module,
     which is how "instrumented computes identically to original" is
     asserted rather than assumed.
+  - `v8.rs` + `v8_host.mjs` — a *second* real embedder, this one the host
+    V8 driven through `node`, returning the same `RuntimeRecording`. It
+    exists because `wasmi` 0.31 cannot enable the exceptions proposal at
+    all, which left every `-fwasm-exceptions` module untestable until
+    M35c. It is also the closer analogue of the deployment target, since
+    spec §1's model is an instrumented module inside an unmodified
+    browser V8.
 - `crates/codetracer-wasm-host-module-framework/` — pluggable pass-through
   host-module factory (replaces hard-coded Stylus stubs).
 - `crates/ct-instrument-cli/` — the thin `ct instrument` CLI (`ct-instrument`
@@ -113,14 +120,33 @@ failed validation in the embedder. Guarded by
 `a_shape_only_unrepresentable_boundary_may_also_exit_by_branch` in
 `tests/boundary_values.rs`.
 
-**Nothing here walks exception-handling or GC instruction sequences.**
-`collect_block_ids` descends into `block` / `loop` / `if`-`else` only, so a
-`return` nested inside a `try_table` body is not wrapped and a label-carrying
-GC/EH instruction naming the function label is not recognised as an exit. The
-consequence is a missing record, never a wrong one. There is no test coverage
-for such modules and the `wasmi` parity oracle cannot provide any: the stub
-host's engine is built without the exceptions proposal and refuses them. Do
-not read the export edge's exit coverage as unconditional.
+**Exception-handling and GC sequences are walked, and `wasmi` cannot test
+them.** `collect_block_ids` (in the instrumenter) and `nested_sequences` (in
+the stub host's static walks) descend into `try_table` bodies, legacy `try`
+bodies and legacy catch handlers as well as `block` / `loop` / `if`-`else`;
+`visit_branch_targets` covers `br_on_null` / `br_on_non_null` / `br_on_cast` /
+`br_on_cast_fail` and `try_table` catch-clause labels alongside the three MVP
+branch forms. The two lists differ on purpose: a `try_table` catch clause names
+an *enclosing label* (a branch target), while a legacy `catch` handler is an
+*owned sequence*. Keep the instrumenter's traversal and the stub host's in
+step — an under-walk in either is a silent under-report, which is exactly how
+M35 stayed open for two milestones.
+
+`wasmi` 0.31 hard-codes `exceptions: false` and exposes no setter, so it
+refuses every such module. `crates/codetracer-wasm-stub-host/src/v8.rs` is the
+second oracle that exists for this: it runs a module under the host V8 via
+`node` (declared in `flake.nix`) and returns the same `RuntimeRecording`, so
+`tests/exception_handling.rs` asserts on values that actually crossed. Prefer
+`wasmi` for anything it can run — it is in-process and exact for NaN payloads
+in the export call's own arguments and results, which V8 is not. Never
+"simplify" the exception tests back onto `wasmi`;
+`the_wasmi_oracle_still_refuses_exception_handling_modules` exists to make that
+attempt fail loudly.
+
+The one residual: the hook surface has no unwind event, so an exception that
+propagates past an open crossing leaves it open. That is a property of the
+surface, not of the walk, and it is loud — the stream is left unbalanced and a
+§6 replayer refuses it outright.
 
 ## Conventions
 
