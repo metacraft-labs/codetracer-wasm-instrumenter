@@ -567,22 +567,58 @@ fn the_parity_check_compares_memory_and_can_detect_a_difference() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. The known exit-path hole, pinned down as a fact
+// 6. Exits taken by branching to the function's own label (M35b)
 // ---------------------------------------------------------------------------
 
-/// An exit taken by branching to the function's own label carries
-/// neither the leave event nor the result capture.
+/// Count the `Return`, LEAVE-marker and `Value` events in a stream.
+fn event_counts(events: &[RuntimeEvent]) -> (usize, usize, usize) {
+    let returns = events
+        .iter()
+        .filter(|e| matches!(e, RuntimeEvent::Return { .. }))
+        .count();
+    let leaves = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                RuntimeEvent::RealmBoundary { direction, .. }
+                    if *direction == hooks::REALM_DIRECTION_LEAVE
+            )
+        })
+        .count();
+    let values = events
+        .iter()
+        .filter(|e| matches!(e, RuntimeEvent::Value { .. }))
+        .count();
+    (returns, leaves, values)
+}
+
+/// A one-export signature table, as the manifest would carry it.
+fn export_signature(name: &str, params: &[ScalarType], results: &[ScalarType]) -> SignatureTable {
+    HashMap::from([(
+        (EXPORT, 0u32),
+        (name.to_string(), params.to_vec(), results.to_vec()),
+    )])
+}
+
+/// An exit taken by branching to the function's own label carries the
+/// leave event and the result capture, exactly as the fall-through
+/// exit does.
 ///
-/// This is a real hole in the export edge, documented rather than
-/// fixed (see the follow-up milestone). It is pinned here for two
-/// reasons: so it cannot be closed by accident without the test
-/// noticing, and — more importantly — so the *shape* of the damage is
-/// on record. The stream is left structurally unbalanced (a call and
-/// an ENTER marker with no matching return or LEAVE), which is what
-/// makes it a detectable missing record rather than a plausible wrong
-/// one: the decoder above refuses such a stream outright.
+/// This used to be a hole. An epilogue appended to the entry
+/// instruction sequence is jumped clean over by a `br` that names the
+/// function label — the branch targets the *end* of that sequence, so
+/// it landed after the very instructions meant to record the exit, and
+/// the stream was left structurally unbalanced (a call and an ENTER
+/// marker with no matching return or LEAVE).
+///
+/// M35b closes it by moving the body into an inner block typed
+/// `[] -> results` and re-pointing the branch at that block, so it now
+/// lands *before* the epilogue. The test below is the inverse of the
+/// one that used to pin the hole: the same fixture, the same computed
+/// answer, and now a stream a replayer-shaped decoder accepts.
 #[test]
-fn an_exit_by_branch_to_the_function_label_is_not_captured() {
+fn an_exit_by_branch_to_the_function_label_is_captured() {
     let wat = r#"
         (module
           (func (export "escape") (param i32) (result i32)
@@ -597,56 +633,371 @@ fn an_exit_by_branch_to_the_function_label_is_not_captured() {
     assert_eq!(
         run.results,
         vec![RecordedValue::I32(101)],
-        "the module still computes correctly — the loss is in the record, not the run"
+        "restructuring the body must not change what the module computes"
     );
 
-    let returns = run
-        .events
-        .iter()
-        .filter(|e| matches!(e, RuntimeEvent::Return { .. }))
-        .count();
-    let leaves = run
-        .events
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                RuntimeEvent::RealmBoundary { direction, .. }
-                    if *direction == hooks::REALM_DIRECTION_LEAVE
-            )
-        })
-        .count();
-    let values = run
-        .events
-        .iter()
-        .filter(|e| matches!(e, RuntimeEvent::Value { .. }))
-        .count();
-
+    let (returns, leaves, values) = event_counts(&run.events);
+    assert_eq!(returns, 1, "the br-to-label exit must emit a leave event");
+    assert_eq!(leaves, 1, "…and its matching LEAVE marker");
     assert_eq!(
-        returns, 0,
-        "known hole: no leave event on a br-to-label exit"
-    );
-    assert_eq!(leaves, 0, "known hole: no LEAVE marker either");
-    assert_eq!(
-        values, 1,
-        "the parameter is still captured; only the result tuple is lost"
+        values, 2,
+        "one parameter and one result — the result tuple is no longer lost"
     );
 
-    // The damage is detectable, not silent: the crossing never closes.
-    let signatures = HashMap::from([(
-        (EXPORT, 0u32),
+    // And the record is not merely present but decodable: a replayer
+    // holding nothing but the stream and the signature reconstructs
+    // both tuples.
+    let signatures = export_signature("escape", &[ScalarType::I32], &[ScalarType::I32]);
+    let crossings = decode(&run.events, &signatures);
+    assert_eq!(crossings.len(), 1, "{crossings:#?}");
+    assert_eq!(crossings[0].args, vec![RecordedValue::I32(1)]);
+    assert_eq!(crossings[0].results, vec![RecordedValue::I32(101)]);
+    assert_eq!(
+        crossings[0].results, run.results,
+        "the decoded result tuple must equal what the engine actually returned"
+    );
+}
+
+/// The three MVP branch forms, each exiting through the function
+/// label, each also calling an import and writing to memory — run
+/// instrumented and un-instrumented under `wasmi` and compared on both
+/// the returned values and the final memory image.
+///
+/// Restructuring a function body is a far more invasive rewrite than
+/// splicing instructions into it, so the event assertions above are
+/// not enough on their own: they would still pass if the new inner
+/// block had changed the order in which the body's side effects ran.
+/// This is the oracle that says it did not. The import call and the
+/// memory write are there so the comparison has something to be wrong
+/// about — `the_parity_check_compares_memory_and_can_detect_a_difference`
+/// proves the memory half of this comparison can fail.
+#[test]
+fn branch_exits_survive_the_parity_oracle() {
+    // Every fixture: store the parameter into memory at a form-specific
+    // address, call the import, then leave through the function label.
+    let cases: [(&str, &str); 3] = [
         (
-            "escape".to_string(),
-            vec![ScalarType::I32],
-            vec![ScalarType::I32],
+            "br",
+            r#"
+            (module
+              (import "env" "note" (func $note (param i32) (result i32)))
+              (memory (export "mem") 1)
+              (func (export "escape") (param i32) (result i32)
+                i32.const 0
+                local.get 0
+                i32.store
+                local.get 0
+                call $note
+                local.get 0
+                i32.add
+                br 0
+                unreachable))
+            "#,
         ),
-    )]);
-    let decoded = std::panic::catch_unwind(|| decode(&run.events, &signatures));
-    assert!(
-        decoded.is_err(),
-        "a replayer-shaped decoder must reject the truncated stream rather than \
-         accept a crossing with a fabricated empty result tuple"
+        (
+            "br_if",
+            r#"
+            (module
+              (import "env" "note" (func $note (param i32) (result i32)))
+              (memory (export "mem") 1)
+              (func (export "escape") (param i32) (result i32)
+                i32.const 4
+                local.get 0
+                i32.store
+                local.get 0
+                call $note
+                local.get 0
+                i32.add
+                local.get 0
+                br_if 0
+                i32.const 1000
+                i32.add))
+            "#,
+        ),
+        (
+            "br_table",
+            r#"
+            (module
+              (import "env" "note" (func $note (param i32) (result i32)))
+              (memory (export "mem") 1)
+              (func (export "escape") (param i32) (result i32)
+                i32.const 8
+                local.get 0
+                i32.store
+                local.get 0
+                call $note
+                local.get 0
+                i32.add
+                local.get 0
+                br_table 0 0 0
+                unreachable))
+            "#,
+        ),
+    ];
+
+    for (label, wat) in cases {
+        let original = wat::parse_str(wat).unwrap_or_else(|e| panic!("{label}: bad wat: {e}"));
+        let instrumented = Pipeline::new()
+            .run_bytes(&original)
+            .unwrap_or_else(|e| panic!("{label}: instrumentation failed: {e:#}"));
+
+        // Both arms of the `br_if` fixture, so the conditional case is
+        // compared on the taken *and* the fall-through path.
+        for input in [7i32, 0i32] {
+            let args = [RecordedValue::I32(input)];
+            let stub =
+                ImportStub::returning("env", "note", vec![vec![RecordedValue::I32(1_000_000)]]);
+            let plain = run_module(&original, "escape", &args, std::slice::from_ref(&stub))
+                .unwrap_or_else(|e| panic!("{label}/{input}: original run failed: {e:#}"));
+            let recorded = run_module(&instrumented, "escape", &args, &[stub])
+                .unwrap_or_else(|e| panic!("{label}/{input}: instrumented run failed: {e:#}"));
+
+            assert_eq!(
+                plain.results, recorded.results,
+                "{label}/{input}: instrumentation changed the value the module returned"
+            );
+            assert_eq!(
+                plain.memory, recorded.memory,
+                "{label}/{input}: instrumentation changed the bytes the module wrote"
+            );
+            assert!(
+                plain
+                    .memory
+                    .as_ref()
+                    .is_some_and(|m| m.iter().any(|b| *b != 0))
+                    || input == 0,
+                "{label}: the fixture must actually write to memory, or the check proves nothing"
+            );
+            assert!(
+                plain.events.is_empty(),
+                "{label}: the un-instrumented module must emit nothing"
+            );
+
+            // The instrumented run is also a *complete* record on every
+            // path: the export crossing closes exactly once, however the
+            // function left.
+            let export_returns = recorded
+                .events
+                .iter()
+                .filter(|e| matches!(e, RuntimeEvent::Return { fn_kind, .. } if *fn_kind == EXPORT))
+                .count();
+            let export_leaves = recorded
+                .events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        RuntimeEvent::RealmBoundary { direction, fn_kind, .. }
+                            if *direction == hooks::REALM_DIRECTION_LEAVE && *fn_kind == EXPORT
+                    )
+                })
+                .count();
+            let (_, _, values) = event_counts(&recorded.events);
+            assert_eq!(
+                export_returns, 1,
+                "{label}/{input}: exactly one export leave event"
+            );
+            assert_eq!(
+                export_leaves, 1,
+                "{label}/{input}: exactly one export LEAVE marker"
+            );
+            assert_eq!(
+                values, 4,
+                "{label}/{input}: export arg + import arg + import result + export result"
+            );
+        }
+    }
+}
+
+/// The zero-result and multi-result block encodings, both reached by a
+/// branch to the function label.
+///
+/// The inner block introduced by M35b is typed by the function's
+/// results, so its block type is `Empty` for a void export, a plain
+/// result type for one, and a real type-section entry
+/// (`BlockType::FunctionType`, the multi-value proposal) for two or
+/// more. All three encodings have to validate and all three have to
+/// leave the stack exactly as the epilogue expects; `escape` above
+/// covers the middle one, and these cover the ends.
+#[test]
+fn branch_exits_are_captured_for_zero_and_multi_result_exports() {
+    // Zero results: the epilogue's capture group is empty, so the
+    // crossing closes on the return event alone.
+    // The function export is declared first so it is export index 0,
+    // which is the index `export_signature` keys the boundary on.
+    let void_wat = r#"
+        (module
+          (memory 1)
+          (func (export "sink") (param i32)
+            i32.const 0
+            local.get 0
+            i32.store
+            br 0
+            unreachable)
+          (export "mem" (memory 0)))
+    "#;
+    let original = wat::parse_str(void_wat).unwrap();
+    let instrumented = instrument(void_wat);
+    let args = [RecordedValue::I32(0x2a)];
+    let plain = run_module(&original, "sink", &args, &[]).unwrap();
+    let run = run_module(&instrumented, "sink", &args, &[]).unwrap();
+    assert!(run.results.is_empty(), "`sink` returns nothing");
+    assert_eq!(
+        plain.memory, run.memory,
+        "a void export's branch exit must not perturb memory"
     );
+    let (returns, leaves, values) = event_counts(&run.events);
+    assert_eq!(returns, 1);
+    assert_eq!(leaves, 1);
+    assert_eq!(values, 1, "one parameter, no results");
+    let crossings = decode(
+        &run.events,
+        &export_signature("sink", &[ScalarType::I32], &[]),
+    );
+    assert_eq!(crossings.len(), 1, "{crossings:#?}");
+    assert_eq!(crossings[0].args, vec![RecordedValue::I32(0x2a)]);
+    assert!(crossings[0].results.is_empty());
+
+    // Three results of mixed type: `MultiValue`, and a result tuple
+    // whose order the spill/restore has to preserve exactly.
+    let multi_wat = r#"
+        (module
+          (func (export "triple") (param i32) (result i32 i64 f64)
+            local.get 0
+            i64.const -5
+            f64.const 2.5
+            br 0
+            unreachable))
+    "#;
+    let run = run_module(
+        &instrument(multi_wat),
+        "triple",
+        &[RecordedValue::I32(9)],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        run.results,
+        vec![
+            RecordedValue::I32(9),
+            RecordedValue::I64(-5),
+            RecordedValue::f64(2.5),
+        ],
+        "the multi-value branch exit must return the tuple unchanged and in order"
+    );
+    let (returns, leaves, values) = event_counts(&run.events);
+    assert_eq!(returns, 1);
+    assert_eq!(leaves, 1);
+    assert_eq!(values, 4, "one parameter plus three results");
+    let crossings = decode(
+        &run.events,
+        &export_signature(
+            "triple",
+            &[ScalarType::I32],
+            &[ScalarType::I32, ScalarType::I64, ScalarType::F64],
+        ),
+    );
+    assert_eq!(crossings.len(), 1, "{crossings:#?}");
+    assert_eq!(
+        crossings[0].results, run.results,
+        "the decoded tuple must equal what the engine returned"
+    );
+}
+
+/// When the branch is conditional, both exits are reachable — and each
+/// records exactly once.
+///
+/// This is the assertion that catches a double epilogue. The
+/// fall-through path leaves the inner block normally and then runs the
+/// epilogue that follows it; if the rewrite had left the original
+/// appended epilogue in place as well, the fall-through run would
+/// report its results twice and the decoder would reject the stream.
+#[test]
+fn a_conditional_branch_exit_records_exactly_once_on_either_path() {
+    let wat = r#"
+        (module
+          (func (export "pick") (param i32) (result i32)
+            i32.const 100
+            local.get 0
+            br_if 0
+            drop
+            i32.const 200))
+    "#;
+    let instrumented = instrument(wat);
+    let signatures = export_signature("pick", &[ScalarType::I32], &[ScalarType::I32]);
+
+    // 1 -> the branch is taken; 0 -> the body falls out of the block.
+    for (input, expected) in [(1i32, 100i32), (0i32, 200i32)] {
+        let run = run_module(&instrumented, "pick", &[RecordedValue::I32(input)], &[]).unwrap();
+        assert_eq!(
+            run.results,
+            vec![RecordedValue::I32(expected)],
+            "input {input}: the conditional must still pick the same answer"
+        );
+        let (returns, leaves, values) = event_counts(&run.events);
+        assert_eq!(
+            returns, 1,
+            "input {input}: exactly one leave event, not two"
+        );
+        assert_eq!(
+            leaves, 1,
+            "input {input}: exactly one LEAVE marker, not two"
+        );
+        assert_eq!(
+            values, 2,
+            "input {input}: one parameter and one result — a second epilogue \
+             would report the result tuple twice"
+        );
+        let crossings = decode(&run.events, &signatures);
+        assert_eq!(crossings.len(), 1, "{crossings:#?}");
+        assert_eq!(crossings[0].results, vec![RecordedValue::I32(expected)]);
+    }
+}
+
+/// An explicit `return` nested inside the restructured body is still
+/// found and still wrapped.
+///
+/// Moving the body into an inner block relocates every `return` in the
+/// function along with it. The pass that wraps them walks from the
+/// entry sequence, so it only reaches them because the `Instr::Block`
+/// naming the inner sequence is already in place by the time it runs.
+/// Get that ordering wrong and explicit returns silently stop being
+/// recorded in exactly the functions this milestone restructures —
+/// which is a regression the branch-exit tests above cannot see.
+#[test]
+fn an_explicit_return_is_still_wrapped_inside_a_restructured_body() {
+    let wat = r#"
+        (module
+          (func (export "both") (param i32) (result i32)
+            (block $inner
+              (br_if $inner (i32.eqz (local.get 0)))
+              (return (i32.const 111)))
+            i32.const 222
+            local.get 0
+            br_if 0
+            drop
+            i32.const 333))
+    "#;
+    let instrumented = instrument(wat);
+    let signatures = export_signature("both", &[ScalarType::I32], &[ScalarType::I32]);
+
+    // 1 -> the explicit `return`; 0 -> out of `$inner`, then the
+    // `br_if 0` is not taken either, so the fall-through exit runs.
+    for (input, expected) in [(1i32, 111i32), (0i32, 333i32)] {
+        let run = run_module(&instrumented, "both", &[RecordedValue::I32(input)], &[]).unwrap();
+        assert_eq!(
+            run.results,
+            vec![RecordedValue::I32(expected)],
+            "input {input}: restructuring must not change which exit is taken"
+        );
+        let (returns, leaves, values) = event_counts(&run.events);
+        assert_eq!(returns, 1, "input {input}: exactly one leave event");
+        assert_eq!(leaves, 1, "input {input}: exactly one LEAVE marker");
+        assert_eq!(values, 2, "input {input}: one parameter and one result");
+        let crossings = decode(&run.events, &signatures);
+        assert_eq!(crossings.len(), 1, "{crossings:#?}");
+        assert_eq!(crossings[0].results, vec![RecordedValue::I32(expected)]);
+    }
 }
 
 fn instrument(wat: &str) -> Vec<u8> {

@@ -85,14 +85,36 @@
 //!   the module is **rejected** with a diagnostic naming the
 //!   function rather than recorded with a hole in its value stream
 //!   (spec § 8).
-//! - Exit sites reached by branching to the function's own label
-//!   (`br` / `br_if` / `br_table` targeting the body) carry neither
-//!   the leave event nor the result capture. Only the fall-through
-//!   exit and explicit `return` are covered — the same set the V1
-//!   leave event covered, so this is a pre-existing gap rather than
-//!   one value capture introduces. The consequence is a *missing*
-//!   record, never a wrong one: the computation is untouched either
-//!   way.
+//! - **Exception-handling and GC instruction sequences are not walked
+//!   at all.** `collect_block_ids` descends into `block`, `loop` and
+//!   `if`/`else` only, so nothing inside a `try_table` body or a
+//!   catch clause is seen by any pass here. Two consequences, and the
+//!   second is the larger one. First, a label-carrying instruction of
+//!   those proposals (`br_on_cast`, `br_on_null`, a `try_table` catch
+//!   clause, …) is not recognised as an exit when it names the
+//!   function's own label. Second, an ordinary explicit `return`
+//!   nested inside a `try_table` body is **not wrapped either**, so
+//!   that exit emits no leave event and no result capture even though
+//!   it is not an exotic exit shape at all.
+//!   As with every gap here the consequence is a *missing* record,
+//!   never a wrong one — the exit still leaves the function with the
+//!   same values, and the computation is untouched. There is no test
+//!   coverage for these modules, and the `wasmi`-backed parity oracle
+//!   cannot supply any: its engine is built without the exceptions
+//!   proposal, so it refuses such a module outright.
+//!
+//! The exit-site coverage of the export edge is complete for
+//! MVP control flow as of M35b: the fall-through exit, an explicit
+//! `return`, and an exit taken by branching to the function's own
+//! label (`br` / `br_if` / `br_table`) all emit the leave event and
+//! the result capture. The last of those used to be a hole — an
+//! epilogue appended to the entry sequence is jumped clean over by a
+//! branch to the function label. It is closed by moving the body into
+//! an inner block typed `[] -> results` and re-pointing those branches
+//! at that block, so they land before the epilogue rather than after
+//! it; see `wrap_local_function_boundary`'s implementation. The
+//! restructuring is applied only to functions that actually contain
+//! such a branch.
 
 #![deny(rust_2018_idioms, unused_must_use)]
 #![warn(missing_docs)]
@@ -1723,6 +1745,26 @@ fn wrap_local_function_boundary(
     sig: &BoundarySignature,
     scratch: Option<&ScratchPool>,
 ) {
+    // M35b: an exit taken by branching to the function's *own* label
+    // (`br`/`br_if`/`br_table` naming the entry sequence) jumps to the
+    // end of the entry sequence — i.e. past an epilogue appended
+    // there. Such an exit would carry neither the leave event nor the
+    // result capture. The fix moves the body into a fresh inner block
+    // typed `[] -> results` and re-points those branches at it, so a
+    // branch that named the function label now lands *before* the
+    // epilogue instead of after it.
+    //
+    // Deliberately scan first and restructure only when at least one
+    // branch actually names the entry label. The vast majority of
+    // functions have no such branch, and leaving them on the original
+    // code path keeps their instrumented bytes identical to what the
+    // golden/parity fixtures pinned — the new shape stays confined to
+    // the one case it exists for, which is also the only case it has
+    // been reasoned about for.
+    if function_branches_to_entry(module, target) {
+        reroot_body_into_inner_block(module, target);
+    }
+
     let kind = match &mut module.funcs.get_mut(target).kind {
         FunctionKind::Local(lf) => lf,
         _ => return,
@@ -1787,6 +1829,127 @@ fn wrap_local_function_boundary(
     // Also wrap any explicit `return` instructions that appear
     // inside any block of this function.
     wrap_returns_in_function(module, target, export_index, hooks, sig, scratch);
+}
+
+/// Does any `br` / `br_if` / `br_table` in `target` name the
+/// function's own entry label?
+///
+/// Such a branch is an exit: it leaves the function with the results
+/// on the stack, exactly as a fall-through or an explicit `return`
+/// does. It is also the only exit shape that an epilogue appended to
+/// the entry sequence cannot see, which is why it gets its own scan.
+fn function_branches_to_entry(module: &Module, target: FunctionId) -> bool {
+    let local_func = match &module.funcs.get(target).kind {
+        FunctionKind::Local(lf) => lf,
+        _ => return false,
+    };
+    let entry = local_func.entry_block();
+    collect_block_ids(local_func, entry).into_iter().any(|id| {
+        local_func.block(id).instrs.iter().any(|(instr, _)| {
+            let mut hit = false;
+            visit_branch_targets(instr, |block| hit |= *block == entry);
+            hit
+        })
+    })
+}
+
+/// Move `target`'s body into a fresh inner block typed
+/// `[] -> results`, re-pointing every branch that named the function
+/// label at that block, and leave the entry sequence holding just the
+/// `Instr::Block` that runs it.
+///
+/// The rewrite is stack-neutral: the inner block's result type is the
+/// function's result type, so it leaves exactly the values the removed
+/// fall-through left, in the same order, for an epilogue appended
+/// after it. Nothing about the computation changes — only where a
+/// label-targeting branch lands.
+///
+/// Re-pointing is a pure `InstrSeqId` substitution. walrus stores
+/// branch targets symbolically and computes the relative depth a `br`
+/// encodes only at emit time (by searching the enclosing block stack),
+/// so introducing a new enclosing block renumbers every other depth in
+/// the function for free and no depth arithmetic is needed here.
+fn reroot_body_into_inner_block(module: &mut Module, target: FunctionId) {
+    // `InstrSeqType::new` picks the encoding by arity: `Simple(None)`
+    // for a void export, `Simple(Some(ty))` for the single-result
+    // case, and `MultiValue(TypeId)` — a real entry in the type
+    // section, encoded as `BlockType::FunctionType` — for two or more.
+    //
+    // The types come from the module's own type table rather than from
+    // the `BoundarySignature`. The two agree whenever the signature is
+    // representable, but a signature mentioning `externref`, `funcref`
+    // or `v128` carries *empty* param and result vectors by design
+    // (see `BoundarySignature::unrepresentable`), and with value
+    // capture switched off such a module is instrumented rather than
+    // refused. Typing the inner block from that empty vector would
+    // emit a block that drops the function's results on the floor and
+    // a module that no longer validates.
+    let results: Vec<ValType> = module.types.results(module.funcs.get(target).ty()).to_vec();
+    let seq_ty = walrus::ir::InstrSeqType::new(&mut module.types, &[], &results);
+
+    let local_func = match &mut module.funcs.get_mut(target).kind {
+        FunctionKind::Local(lf) => lf,
+        _ => return,
+    };
+    let entry = local_func.entry_block();
+    let inner = local_func.builder_mut().dangling_instr_seq(seq_ty).id();
+
+    let body = std::mem::take(&mut local_func.block_mut(entry).instrs);
+    local_func.block_mut(inner).instrs = body;
+
+    // The body now lives under `inner`, so walk from there. The entry
+    // sequence is empty at this point.
+    for id in collect_block_ids(local_func, inner) {
+        for (instr, _) in local_func.block_mut(id).instrs.iter_mut() {
+            visit_branch_targets_mut(instr, |block| {
+                if *block == entry {
+                    *block = inner;
+                }
+            });
+        }
+    }
+
+    local_func.block_mut(entry).instrs.push((
+        Instr::Block(walrus::ir::Block { seq: inner }),
+        walrus::ir::InstrLocId::new(0),
+    ));
+}
+
+/// Apply `f` to every branch-target label `instr` carries.
+///
+/// Only the three MVP branch forms are covered. The GC and
+/// exception-handling proposals add further label-carrying
+/// instructions (`br_on_cast`, a `try_table` catch clause, …); a
+/// module using those keeps the pre-M35b behaviour on that one exit —
+/// a *missing* record, never a wrong one, because a branch left
+/// pointing at the entry label still exits the function with the same
+/// values. Widening this to the GC forms is safe but unexercised, so
+/// it is left for the milestone that has fixtures for them.
+fn visit_branch_targets(instr: &Instr, mut f: impl FnMut(&InstrSeqId)) {
+    match instr {
+        Instr::Br(walrus::ir::Br { block }) | Instr::BrIf(walrus::ir::BrIf { block }) => f(block),
+        Instr::BrTable(walrus::ir::BrTable { blocks, default }) => {
+            for block in blocks.iter() {
+                f(block);
+            }
+            f(default);
+        }
+        _ => {}
+    }
+}
+
+/// [`visit_branch_targets`], by mutable reference.
+fn visit_branch_targets_mut(instr: &mut Instr, mut f: impl FnMut(&mut InstrSeqId)) {
+    match instr {
+        Instr::Br(walrus::ir::Br { block }) | Instr::BrIf(walrus::ir::BrIf { block }) => f(block),
+        Instr::BrTable(walrus::ir::BrTable { blocks, default }) => {
+            for block in blocks.iter_mut() {
+                f(block);
+            }
+            f(default);
+        }
+        _ => {}
+    }
 }
 
 fn wrap_returns_in_function(

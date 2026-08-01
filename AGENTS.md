@@ -36,7 +36,7 @@ yourself needing a tool that is not in `flake.nix`, add it to `flake.nix`.
 | Command                        | What it does                                                     |
 | ------------------------------ | ---------------------------------------------------------------- |
 | `just build`                   | `cargo build --workspace --release --locked`                     |
-| `just test`                    | `cargo test --workspace --locked` — the whole suite (55 tests)    |
+| `just test`                    | `cargo test --workspace --locked` — the whole suite (60 tests)    |
 | `just test-plugins`            | `node --test` over the bundler plugin wrappers in `plugins/`      |
 | `just test-runtime`            | `node --test` over the shims in `recorder-runtime/`               |
 | `just lint`                    | `cargo clippy … -D warnings`, `cargo fmt --check`, `nixfmt --check` |
@@ -98,6 +98,29 @@ instrumented module and the interpreter recorder genuinely disagree.
 Because the sibling fixtures are not visible inside the Nix sandbox,
 `packages.default` sets `doCheck = false`; the suite is run from the dev shell
 via `just test`.
+
+**A `BoundarySignature` is not a description of a function's wasm type.**
+When a signature mentions `externref`, `funcref` or `v128` it carries *empty*
+`params`/`results` and sets `unrepresentable` — a deliberate design (a partial
+tuple would shift every slot index after the gap). The rejection pass that
+turns that into a hard error runs **only when `capture_boundary_values` is on**,
+so with `PipelineConfig::capture_boundary_values = false` such a module is
+instrumented rather than refused, and any rewrite that needs the function's
+real types must read them from `module.types`, never from the signature. This
+already bit once: the branch-exit rewrite typed its inner block from
+`sig.results` and emitted a module that dropped the results on the floor and
+failed validation in the embedder. Guarded by
+`a_shape_only_unrepresentable_boundary_may_also_exit_by_branch` in
+`tests/boundary_values.rs`.
+
+**Nothing here walks exception-handling or GC instruction sequences.**
+`collect_block_ids` descends into `block` / `loop` / `if`-`else` only, so a
+`return` nested inside a `try_table` body is not wrapped and a label-carrying
+GC/EH instruction naming the function label is not recognised as an exit. The
+consequence is a missing record, never a wrong one. There is no test coverage
+for such modules and the `wasmi` parity oracle cannot provide any: the stub
+host's engine is built without the exceptions proposal and refuses them. Do
+not read the export edge's exit coverage as unconditional.
 
 ## Conventions
 

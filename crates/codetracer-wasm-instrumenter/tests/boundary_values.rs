@@ -1017,3 +1017,47 @@ fn reference_typed_boundaries_are_rejected_with_a_diagnostic() {
         .run_bytes(&original)
         .expect("call-shape-only instrumentation stays available");
 }
+
+/// …including when that same unrepresentable boundary also exits by
+/// branching to its own function label.
+///
+/// This is where the two features meet and used to break each other.
+/// `BoundarySignature` deliberately empties its param and result
+/// vectors when the signature mentions a type no value hook can carry,
+/// so a signature is *not* a description of the function's wasm type in
+/// that case. The branch-exit rewrite types its inner block from the
+/// function's results; reading them off the signature produced a block
+/// that discarded the results, and — because the rejection pass only
+/// runs when value capture is on — nothing upstream stopped it. The
+/// emitted module then failed validation in the embedder rather than
+/// anywhere near the cause.
+#[test]
+fn a_shape_only_unrepresentable_boundary_may_also_exit_by_branch() {
+    let wat = r#"
+        (module
+          (func (export "escape") (param externref) (result i32)
+            i32.const 7
+            br 0
+            unreachable))
+    "#;
+    let original = wat::parse_str(wat).expect("valid wat");
+    let config = PipelineConfig {
+        capture_boundary_values: false,
+        ..PipelineConfig::default()
+    };
+    let instrumented = Pipeline::with_config(config)
+        .run_bytes(&original)
+        .expect("call-shape-only instrumentation stays available");
+
+    // wasmi validates on `Module::new`, which `run_module` reports as
+    // "wasmi rejected the module". The call itself cannot proceed —
+    // the host has no `externref` to pass — so a later error is the
+    // pass condition, and an invalid module is the failure.
+    let err = run_module(&instrumented, "escape", &[], &[])
+        .expect_err("the export cannot actually be called with no argument");
+    let text = format!("{err:#}");
+    assert!(
+        !text.contains("wasmi rejected the module"),
+        "instrumenting a shape-only boundary must leave a valid module: {text}"
+    );
+}
