@@ -3,7 +3,7 @@ schema = "reprobuild.solved-graph-lock.v2"
 [lock]
 platform = "amd64-linux"
 optimal = false
-inputs_digest = "fnv1a64:c247e0f8754f852d"
+inputs_digest = "fnv1a64:79ff0a4d91b36d8d"
 variants = []
-packages = [{ name = "cargo", version = "1.83.0", source = "cargo" }, { name = "codetracer_wasm_instrumenter", version = "0.1.0", source = "codetracer_wasm_instrumenter" }, { name = "rustc", version = "1.83.0", source = "rustc" }]
-deps = [{ name = "codetracer-wasm-instrumenter", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-wasm-instrumenter", ref = "", revision = "788bc121b7606745efa2bafb0c46df89a0768f5a", integrity = "git-sha1:788bc121b7606745efa2bafb0c46df89a0768f5a", version = "", visibility = "public", participation = "", depends = "", groups = "" }]
+packages = [{ name = "cargo", version = "1.83.0", source = "cargo", selection = "selected" }, { name = "codetracer_wasm_instrumenter", version = "0.1.0", source = "codetracer_wasm_instrumenter", selection = "selected" }, { name = "rustc", version = "1.83.0", source = "rustc", selection = "selected" }]
+deps = [{ name = "codetracer-wasm-instrumenter", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-wasm-instrumenter", ref = "dev", revision = "88887cedab8829115c3f0fb2b65dc3a4ea93d3bc", integrity = "git-sha1:88887cedab8829115c3f0fb2b65dc3a4ea93d3bc", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
