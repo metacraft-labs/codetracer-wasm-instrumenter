@@ -26,10 +26,10 @@ fn golden_path(name: &str) -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidates = [
         manifest_dir.join(format!(
-            "../../../codetracer-wasm-recorder/cmd/wazero/testdata/recorder-golden/{name}"
+            "../../../codetracer-wasm-recorder/cmd/wazero/testdata/recorder-golden/build/{name}"
         )),
         manifest_dir.join(format!(
-            "../../codetracer-wasm-recorder/cmd/wazero/testdata/recorder-golden/{name}"
+            "../../codetracer-wasm-recorder/cmd/wazero/testdata/recorder-golden/build/{name}"
         )),
     ];
     candidates.into_iter().find(|c| c.exists())

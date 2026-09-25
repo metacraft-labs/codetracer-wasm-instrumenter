@@ -11,11 +11,11 @@ at all. The interpreter-based recorders (`codetracer-wasm-recorder`,
 ## Dev environment
 
 The repo is self-contained: a Nix flake supplies the whole toolchain and
-`direnv` enters it automatically.
+the repro shell hook enters it automatically.
 
 ```bash
-direnv allow            # first time only
-nix develop             # or just `cd` in with direnv active
+repro allow             # first time only
+repro exec -- just test  # or just `cd` in with the repro hook active
 ```
 
 `flake.nix` provides:
@@ -95,7 +95,9 @@ just Rust — no Nim, capnp or zstd as in the trace-format-consuming recorders.
 
 `crates/codetracer-wasm-stub-host/tests/parity.rs` reads golden `.wasm`
 fixtures from the sibling checkout
-`../codetracer-wasm-recorder/cmd/wazero/testdata/recorder-golden/`. In this
+`../codetracer-wasm-recorder/cmd/wazero/testdata/recorder-golden/build/`.
+`just test` runs the recorder's `TestRecorderGoldenFixturesBuild` through
+`repro exec` first, using its pinned compiler and existing content stamp. In this
 workspace the sibling is present, so all four parity tests execute their real
 `assert_parity` assertions. The test defines a source-level skip arm for
 shallow clones that lack the sibling — **never** widen that arm to make a

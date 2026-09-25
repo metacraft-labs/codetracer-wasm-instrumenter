@@ -87,6 +87,7 @@
 ## required for uses declarations".
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 
 package codetracer_wasm_instrumenter:
   defaultToolProvisioning "path"
@@ -109,6 +110,9 @@ package codetracer_wasm_instrumenter:
     name: "ct-instrument"
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     activity "default"
 
   build:

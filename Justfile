@@ -35,7 +35,12 @@ test: test-rust
 # `node`, because `wasmi` cannot enable the exceptions proposal. `node`
 # comes from this repo's own flake, so the suite is self-contained from
 # inside the dev shell.
-test-rust:
+# Reuse the producer's pinned compiler and content-stamped fixture builder.
+# The recorder removed committed wasm binaries; consumers use its build output.
+test-golden-fixtures:
+    repro exec ../codetracer-wasm-recorder -- sh -c 'cd ../codetracer-wasm-recorder && go test ./cmd/wazero -run "^TestRecorderGoldenFixturesBuild$" -count=1'
+
+test-rust: test-golden-fixtures
     cargo test --workspace --locked
 
 # The bundler plugin wrappers under `plugins/` are plain ESM modules
