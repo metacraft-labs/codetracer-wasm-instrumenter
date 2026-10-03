@@ -27,7 +27,7 @@ let
     cc = pkgs.stdenv.cc.cc;
     nixSupport = {
       cc-cflags = "-I${pkgs.lib.getDev pkgs.zstd}/include";
-      cc-ldflags = "-L${pkgs.lib.getLib pkgs.zstd}/lib -Wl,-rpath,${pkgs.lib.getLib pkgs.zstd}/lib";
+      cc-ldflags = "-L${pkgs.lib.getLib pkgs.zstd}/lib -rpath ${pkgs.lib.getLib pkgs.zstd}/lib";
     };
   };
 in
