@@ -71,6 +71,10 @@ jobs:
         with:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
+          # The full parity suites consume both workspace-locked producers.
+          siblings: |
+            codetracer-evm-recorder
+            codetracer-wasm-recorder
 
       - name: repro build
         # Builds the conventional `build` collection declared in
