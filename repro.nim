@@ -32,8 +32,9 @@
 ## sibling — the lock is self-only (``deps = [<this repo>]``).
 ##
 ## Because there is no cross-repo Nim FFI build.rs (grep confirms the tree
-## carries no ``build.rs`` at all), the toolchain floor is JUST the Rust
-## toolchain — no ``nim`` / ``nimble`` / ``capnp`` / ``zstd`` /
+## carries no ``build.rs`` at all), the toolchain floor is the Rust
+## toolchain, the C linker driver rustc links through, and ``node`` for the
+## V8 oracle below — no ``nim`` / ``nimble`` / ``capnp`` / ``zstd`` /
 ## ``pkg-config`` that the trace-format-consuming recorders need.
 ##
 ## **Test corpus & per-test platform gating.** ``cargo test --locked`` is
@@ -55,11 +56,10 @@
 ##     in-repo config fixtures.
 ##   * ``codetracer-wasm-instrumenter/tests/exception_handling.rs`` shells
 ##     out to ``node`` (M35c). It is portable in the same sense as the
-##     rest: ``node`` is supplied by this repo's own ``flake.nix``
-##     (``nodejs_22``), exactly as it already is for ``just test-runtime``
-##     and ``just test-plugins``, so this adds no NEW toolchain floor
-##     beyond what those recipes already require — it only moves a node
-##     dependency into the ``cargo test`` edge. It carries no ``#[ignore]``
+##     rest: ``node`` is declared in ``uses:`` and attached to the
+##     ``cargo test`` run edge as a tool identity (the flake's dev shell
+##     carries the same ``nodejs_22`` for ``just test``, ``just
+##     test-runtime`` and ``just test-plugins``). It carries no ``#[ignore]``
 ##     and no skip arm: without ``node`` the suite FAILS, deliberately,
 ##     because a silently skipped oracle is how the gap it covers survived
 ##     two milestones. The reason it cannot use the in-process ``wasmi``
@@ -102,6 +102,19 @@ package codetracer_wasm_instrumenter:
     # that resolves the crates.io deps (walrus 0.26 / wasmparser 0.245).
     "rustc >=1.83"
     "cargo >=1.83"
+    # C compiler driver -- rustc links every binary (the ``ct-instrument``
+    # CLI and each test executable) through ``cc`` on Linux/macOS. Declaring
+    # it puts the driver on the cargo edges' PATH instead of leaving it to
+    # whatever the ambient shell carries. Windows links with MSVC instead.
+    when defined(linux):
+      "gcc"
+    elif defined(macosx):
+      "clang"
+    # Node.js -- ``tests/exception_handling.rs`` runs every exceptions-
+    # proposal module under the host V8 through ``node``
+    # (``codetracer-wasm-stub-host/src/v8.rs``), because ``wasmi`` cannot
+    # enable that proposal. The flake's dev shell carries ``nodejs_22``.
+    "node >=22"
 
   # The shipping binary — the ``ct-instrument`` bin target of the
   # ``ct-instrument-cli`` workspace member. The per-app cargo build edge
@@ -184,5 +197,20 @@ package codetracer_wasm_instrumenter:
       actionId = "codetracer-wasm-instrumenter.cargo-test-run",
       after = @[testsBuild.action],
       extraInputs = workspaceInputs & @["target/debug/deps"])
+
+    # Tool identities the cargo edges execute. Reprobuild's stdlib attaches
+    # only a typed tool's own sub-tools, so every other program an action
+    # runs must be attached here (and declared in ``uses:`` above): the
+    # Rust toolchain itself, the C linker driver rustc invokes, and -- for
+    # the test-run edge only -- the ``node`` the V8 oracle spawns. Without
+    # these refs the action fingerprint ignores those tools and, outside
+    # PATH mode, the action cannot find them at all.
+    const linkerRefs = (when defined(linux): @["gcc"]
+                        elif defined(macosx): @["clang"]
+                        else: newSeq[string]())
+    for actionId in [cliBuild.id, testsBuild.action.id, testsRun.action.id]:
+      appendRegisteredActionToolIdentityRefs(actionId,
+        @["cargo", "rustc"] & linkerRefs)
+    appendRegisteredActionToolIdentityRefs(testsRun.action.id, ["node"])
 
     discard collect("test", @[testsRun.action])
