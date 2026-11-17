@@ -107,14 +107,14 @@
 ##     against the Nim packages its ``.nimble`` requires (``stew``,
 ##     ``results``). They are passed as ``nimDependencyDirs`` from the
 ##     workspace's sibling checkouts, so the compile does not resolve them
-##     from whatever the host's ``~/.nimble`` happens to hold. Two gaps
-##     remain. ``buildSharedLib`` does not pass ``--noNimblePath``, so Nim
-##     still searches its default nimble package directory after these
-##     paths: a module missing from a sibling would be resolved from there
-##     silently, not refused (with both siblings complete, the monitor
-##     records no read under it). And this repository's lock pins
-##     ``nim-stew`` but not ``nim-results``, so the ``results`` the writer
-##     compiles against is whatever revision that checkout holds.
+##     from whatever the host's ``~/.nimble`` happens to hold. Whenever
+##     ``nimDependencyDirs`` is given, ``buildSharedLib`` also passes
+##     ``--noNimblePath``, so Nim never searches its default nimble package
+##     directory: the compile reads nothing under ``~/.nimble``, and a module
+##     missing from a sibling is refused (``cannot open file``) rather than
+##     resolved from the host. Both siblings, ``nim-stew`` and
+##     ``nim-results``, are pinned in this repository's lock, so the writer
+##     compiles against fixed revisions of them.
 ##
 ## **Node.** ``codetracer-wasm-instrumenter/tests/exception_handling.rs``
 ## runs every exceptions-proposal module under the host V8 through
