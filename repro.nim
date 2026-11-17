@@ -86,16 +86,35 @@
 ##     and the Go test link against one zstd.
 ##   * **Relinking.** Go's build cache keys a cgo link on its flags, not on
 ##     the bytes of the libraries they name: a rebuilt writer library in an
-##     unchanged directory would be served from a cached link. The edge
-##     therefore owns its Go build cache (``GOCACHE``) and the engine
-##     removes it before every run. The writer library is a declared input,
-##     so changing it reruns the edge, and every run compiles and links from
-##     an empty cache. ``-count=1`` (in the owning command) keeps Go from
-##     replaying a cached test result.
-##   * The builder writes its outputs atomically (process-private temporary
-##     file, then rename) and reuses them only when its compiler/source
-##     stamp matches. The whole output directory, stamp included, is
-##     declared, and nothing here bypasses or pre-creates it.
+##     unchanged directory would be served from a cached link. Two things
+##     close that gap. The writer library (with its headers) is a declared
+##     input, so its bytes are part of the edge's action-cache key: a changed
+##     library misses the cache and the engine runs the edge. And the Go
+##     build cache (``GOCACHE``) is an edge-owned scratch directory, which
+##     the engine empties before every run, so a run that does happen
+##     compiles and links from an empty cache and cannot reuse a link made
+##     against the old library. The edge is therefore cacheable: a hit is
+##     only possible when every declared input, the writer library included,
+##     is unchanged. ``-count=1`` (in the owning command) keeps Go from
+##     replaying a cached test result within a run.
+##   * The builder writes its outputs atomically (``<name>.wasm.tmp<pid>``,
+##     then rename) and reuses them only when its compiler/source stamp
+##     matches; ``rustc`` writes its own temporaries there too. The whole
+##     output directory is therefore declared as the edge's write root, and
+##     the stamp and the five ``.wasm`` files as the outputs it must
+##     produce. Nothing here bypasses or pre-creates the directory.
+##   * **Nim sources of the writer.** ``buildSharedLib`` compiles the writer
+##     against the Nim packages its ``.nimble`` requires (``stew``,
+##     ``results``). They are passed as ``nimDependencyDirs`` from the
+##     workspace's sibling checkouts, so the compile does not resolve them
+##     from whatever the host's ``~/.nimble`` happens to hold. Two gaps
+##     remain. ``buildSharedLib`` does not pass ``--noNimblePath``, so Nim
+##     still searches its default nimble package directory after these
+##     paths: a module missing from a sibling would be resolved from there
+##     silently, not refused (with both siblings complete, the monitor
+##     records no read under it). And this repository's lock pins
+##     ``nim-stew`` but not ``nim-results``, so the ``results`` the writer
+##     compiles against is whatever revision that checkout holds.
 ##
 ## **Node.** ``codetracer-wasm-instrumenter/tests/exception_handling.rs``
 ## runs every exceptions-proposal module under the host V8 through
@@ -132,6 +151,9 @@ const
     ## golden-fixture edge runs in it and writes its fixture directory.
   nimRoot = "../codetracer-trace-format-nim"
     ## The trace-format-nim checkout that owns the C ABI writer library.
+  writerNimDependencyRoots = ["../nim-stew", "../nim-results"]
+    ## Sibling checkouts of the Nim packages ``codetracer_trace_format.nimble``
+    ## requires (``stew``, ``results``), handed to ``buildSharedLib``.
   fixtureScratch = ".repro/build/golden-fixtures"
     ## Scratch tree the golden-fixture edge owns (Go caches, TMPDIR).
   goldenFixtureDir = recorderRoot / "cmd/wazero/testdata/recorder-golden/build"
@@ -244,6 +266,8 @@ package codetracer_wasm_instrumenter:
     # ---- Golden-fixture prerequisite (part of the `test` collection) --
     #
     # See the module doc, "The golden-fixture edge".
+    # The files the edge must produce; the directory that holds them, with
+    # the builder's and rustc's temporaries, is its declared write root.
     var fixtureOutputs = @[goldenFixtureDir / "stamp.txt"]
     for name in goldenFixtureNames:
       fixtureOutputs.add(goldenFixtureDir / (name & ".wasm"))
@@ -266,8 +290,15 @@ package codetracer_wasm_instrumenter:
       # The owning trace-writer producer, compiled by the same SDK compiler
       # wrapper the Go edge links with (its zstd include/link/rpath flags
       # come from that wrapper; see tools/fixture-sdk/default.nix).
+      # Its Nim package dependencies come from the sibling checkouts (module
+      # doc, "Nim sources of the writer"); ``buildSharedLib`` requires them
+      # absolute and existing, and declares them as inputs of its edge.
+      var writerNimDependencyDirs: seq[string] = @[]
+      for dependencyRoot in writerNimDependencyRoots:
+        writerNimDependencyDirs.add(normalizedPath(root / dependencyRoot))
       let writerLibrary = buildSharedLib(nimRoot,
-        compilerSdkRefs = @["fixture-cc-sdk"])
+        compilerSdkRefs = @["fixture-cc-sdk"],
+        nimDependencyDirs = writerNimDependencyDirs)
       appendRegisteredActionToolIdentityRefs(writerLibrary.id, ["nim"])
       let writerArtifact = sharedLibraryPath(nimRoot)
       let writerDir = normalizedPath(root / nimRoot)
@@ -324,17 +355,22 @@ package codetracer_wasm_instrumenter:
           writerArtifact, nimRoot / "include",
           recorderRoot / "tracewriter/codetracer_trace_writer.h",
           recorderRoot / "tracewriter/codetracer_trace_writer_columns.h"]),
-        # The Go build cache is an output the edge owns outright, so the
-        # engine may empty it before each run (module doc, "Relinking").
-        outputs = rooted(fixtureOutputs & @[fixtureScratch / "go-build-cache"]),
-        declaredOutputs = rooted(fixtureOutputs & @[fixtureScratch / "go-build-cache"]),
-        scratchDirs = rooted(@[fixtureScratch / "gopath", fixtureScratch / "tmp"]),
-        removeBeforeRun = rooted(@[fixtureScratch / "go-build-cache"]),
+        outputs = rooted(fixtureOutputs),
+        # The whole fixture output directory: the builder's
+        # ``<name>.wasm.tmp<pid>`` files and rustc's temporaries land there
+        # next to the outputs.
+        declaredOutputs = rooted(@[goldenFixtureDir]),
+        # The Go build cache is scratch the engine empties before every run,
+        # so each run relinks against the current writer library (module
+        # doc, "Relinking"); as scratch it is neither an input nor a cached
+        # output.
+        scratchDirs = rooted(@[fixtureScratch / "go-build-cache",
+          fixtureScratch / "gopath", fixtureScratch / "tmp"]),
         env = goEnv,
         toolIdentityRefs = @["fixture-go-sdk", "fixture-rustc-sdk",
           "fixture-cc-sdk"],
         cwdKind = acwdCustom, cwdCustomPath = recorderRoot,
-        dependencyPolicy = automaticMonitorPolicy(), cacheable = false)
+        dependencyPolicy = automaticMonitorPolicy())
 
     # ---- Test-binary build + run edges (the `test` collection) -------
     #
