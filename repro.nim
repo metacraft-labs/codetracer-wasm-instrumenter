@@ -1,122 +1,198 @@
 ## Reprobuild dev env + build recipe for codetracer-wasm-instrumenter.
 ##
-## A self-contained Rust cargo workspace: the bytecode-rewriting WASM
-## instrumentation pipeline (Value Origin Tracking, M27) plus its stub
-## host, host-module framework, and the ``ct instrument`` CLI. The
-## shipping binary is the ``ct-instrument`` bin target of the
-## ``ct-instrument-cli`` workspace member; the remaining members compile
-## as its transitive deps.
+## A Rust cargo workspace: the bytecode-rewriting WASM instrumentation
+## pipeline plus its stub host, host-module framework, and the
+## ``ct instrument`` CLI. The shipping binary is the ``ct-instrument`` bin
+## target of the ``ct-instrument-cli`` workspace member; the remaining
+## members compile as its transitive deps.
 ##
-## Per ``codetracer-specs/Repo-Requirements.md`` §2.8 the recipe expresses
-## build and test execution NATIVELY through typed-tool edges
-## (``cargo.build``, ``cargo.test``). It does NOT delegate to
-## ``shell(command = "bash scripts/...")`` wrappers — delegation defeats
-## the engine's incremental-build, action-cache, per-test invalidation,
-## and the CI sharding the engine grows into per
-## ``reprobuild-specs/CI-Sharding.md``. This mirrors the sibling
-## Rust-recorder recipes (``codetracer-wasmi-recorder``,
-## ``codetracer-evm-recorder``, ``codetracer-trace-format``).
+## The recipe expresses every build and test the Justfile runs NATIVELY,
+## through typed tool edges (``cargo.build``, ``cargo.test`` and direct
+## ``buildAction`` calls on declared tools). It does not delegate to
+## ``just``, to a recursive ``repro`` or to a ``sh -c`` wrapper: a wrapped
+## command is opaque to the engine, which then cannot see what it reads,
+## cannot cache or invalidate it, and cannot tell which tools ran.
 ##
-## **This repo is a LEAF (from reprobuild's perspective) and a
-## SELF-CONTAINED cargo workspace.** The root ``Cargo.toml`` declares four
-## members (``crates/codetracer-wasm-instrumenter``,
-## ``crates/codetracer-wasm-stub-host``,
-## ``crates/codetracer-wasm-host-module-framework``,
-## ``crates/ct-instrument-cli``) that resolve against each other via
-## IN-REPO ``path = "../<member>"`` deps only. Unlike the wasmi / evm
-## recorders there is NO cross-repo cargo ``path`` dependency on the
-## ``codetracer-trace-format`` sibling: every dependency is either an
-## in-repo member or a crates.io crate (``walrus``, ``wasmparser``,
-## ``wat``, ``clap``, ``serde``, ...). So there is no ``uses:
-## "<sibling>"`` edge, no develop-override, and no vcs LockedDep for any
-## sibling — the lock is self-only (``deps = [<this repo>]``).
+## **Inventory, one-for-one with the Justfile.**
 ##
-## Because there is no cross-repo Nim FFI build.rs (grep confirms the tree
-## carries no ``build.rs`` at all), the toolchain floor is the Rust
-## toolchain, the C linker driver rustc links through, and ``node`` for the
-## V8 oracle below — no ``nim`` / ``nimble`` / ``capnp`` / ``zstd`` /
-## ``pkg-config`` that the trace-format-consuming recorders need.
+##   * ``default`` -- ``just build``: ``cargo build --workspace --release
+##     --locked``, producing ``target/release/ct-instrument``.
+##   * ``test`` -- ``just test`` = ``test-rust``, which first runs the
+##     prerequisite ``test-golden-fixtures`` and then ``cargo test
+##     --workspace --locked``. Here that is three edges: the golden-fixture
+##     Go test (below), the cargo test-binary build, and the cargo test run,
+##     which depends on both.
+##   * ``test-plugins`` -- ``just test-plugins``: ``node --test
+##     index.test.js`` in each ``plugins/*/`` directory, one edge each.
+##   * ``test-runtime`` -- ``just test-runtime``: ``node --test`` over the
+##     three ``recorder-runtime`` suites.
 ##
-## **Test corpus & per-test platform gating.** ``cargo test --locked`` is
-## one whole-workspace cargo run. No test FILE in this repo carries a
-## per-file host gate: grep finds no ``#[cfg(target_os = …)]`` /
-## ``#[cfg(unix)]`` / ``#[cfg(windows)]`` / ``#[ignore]`` attribute on any
-## test function or module in ``crates/*/tests/*.rs`` or in the crates'
-## ``src/`` ``#[cfg(test)]`` unit tests. The integration tests are
-## portable:
+## ``test-plugins`` and ``test-runtime`` are separate collections because
+## the Justfile keeps them out of ``just test``; folding them into ``test``
+## would make ``repro test`` run more than ``just test`` does.
 ##
-##   * ``ct-instrument-cli/tests/cli_smoke.rs`` drives the just-built
-##     ``ct-instrument`` binary (via ``CARGO_BIN_EXE_ct-instrument``) on a
-##     WAT fixture compiled in-process.
-##   * ``codetracer-wasm-instrumenter/tests/verification.rs`` and
-##     ``codetracer-wasm-stub-host/tests/parity.rs`` run the pipeline +
-##     stub-host walk over in-tree / sibling ``.wasm`` fixtures.
-##   * ``codetracer-wasm-host-module-framework/tests/{factory_logs_all_calls,
-##     stylus_parity}.rs`` exercise the TOML-driven plan formatter over
-##     in-repo config fixtures.
-##   * ``codetracer-wasm-instrumenter/tests/exception_handling.rs`` shells
-##     out to ``node`` (M35c). It is portable in the same sense as the
-##     rest: ``node`` is declared in ``uses:`` and attached to the
-##     ``cargo test`` run edge as a tool identity (the flake's dev shell
-##     carries the same ``nodejs_22`` for ``just test``, ``just
-##     test-runtime`` and ``just test-plugins``). It carries no ``#[ignore]``
-##     and no skip arm: without ``node`` the suite FAILS, deliberately,
-##     because a silently skipped oracle is how the gap it covers survived
-##     two milestones. The reason it cannot use the in-process ``wasmi``
-##     embedder is that ``wasmi`` 0.31 hard-codes ``exceptions: false``.
+## **Cross-repository inputs.** The cargo suite reads two sibling
+## repositories at run time, and both are pinned through this repo's
+## ``repro.lock`` (the workspace fragment declares
+## ``depends = ["codetracer-evm-recorder", "codetracer-wasm-recorder"]``):
 ##
-## The four ``parity.rs`` tests read golden ``.wasm`` fixtures from the
-## sibling ``../codetracer-wasm-recorder/cmd/wazero/testdata/recorder-golden/``
-## checkout. That is a RUNTIME file read the test performs itself (not a
-## cargo build-graph input, so it is NOT a cross-repo ``uses:`` edge), and
-## the fixtures ARE present in this workspace — so all four parity tests
-## execute REAL ``assert_parity`` assertions here, not the source-level
-## SKIP arm the test defines for shallow-clone environments. Nothing is
-## weakened or skipped by this recipe.
+##   * ``codetracer-wasm-host-module-framework/tests/stylus_parity.rs``
+##     reads ``../codetracer-evm-recorder/stylus/codetracer.toml`` and the
+##     WASM recorder's legacy ``internal/stylus/stylus_funcs.go``;
+##   * ``codetracer-wasm-stub-host/tests/parity.rs`` and
+##     ``codetracer-wasm-instrumenter/tests/boundary_values.rs`` read the
+##     WASM recorder's golden ``.wasm`` fixtures from
+##     ``cmd/wazero/testdata/recorder-golden/build/``.
 ##
-## So the corpus runs identically on every host cargo supports, and the
-## single whole-workspace ``cargo.test`` execute edge below matches the
-## repo's own ``cargo test --locked`` one-for-one — there is no per-OS
-## partition to model and no ``when defined(...)`` extraction gate.
+## Those fixtures are NOT committed anywhere. The WASM recorder compiles
+## them from their Rust sources during its own Go test run, with a compiler
+## its flake pins, and stamps the result with the compiler identity and the
+## source bytes. So this recipe does not assume they are present: it runs
+## that owning Go test as a typed edge, and the cargo run consumes the
+## directory the edge produces. Without that edge the parity tests would
+## take the skip arm they keep for checkouts that lack the sibling, and a
+## skipped parity test is not evidence of anything.
 ##
-## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical Rust-recorder recipes: the dev shell (rustup toolchain on
-## Linux/macOS, ``env.ps1`` on Windows) puts ``cargo`` / ``rustc`` on
-## ``PATH``, so the weak-local PATH resolver is the right default. Without
-## it ``repro build`` refuses to run with "typed tool provisioning is
-## required for uses declarations".
+## **The golden-fixture edge.** It runs exactly the command ``just
+## test-golden-fixtures`` runs, in the WASM recorder's checkout:
+##
+##     go test ./cmd/wazero -run "^TestRecorderGoldenFixturesBuild$" -count=1
+##
+## The selector is the owning builder's own completeness test; it does not
+## stand in for the recorder's full suite. Its contract with this graph:
+##
+##   * ``cmd/wazero`` is built WITH cgo, as the dev shell builds it.
+##     ``tracewriter/ctfs_writer.go`` (``//go:build cgo``) links
+##     ``-lcodetracer_trace_writer -lzstd -lm -lpthread`` and includes the
+##     trace-writer header and the recorder's own column header. The
+##     cgo-disabled stub would also compile, but switching to it would test
+##     a package variant nobody ships.
+##   * The C ABI writer library is the owning producer's own typed edge,
+##     ``build_writer_artifacts.buildSharedLib`` from
+##     ``codetracer-trace-format-nim``, constructed in this graph and
+##     declared as an input and prerequisite of the Go edge, together with
+##     its public header directory. ``CGO_CFLAGS`` names the header
+##     directory and ``CGO_LDFLAGS`` the library directory, plus an rpath to
+##     it so the test binary finds the shared library at run time.
+##   * The compilers are the immutable SDK the WASM recorder's ``shell.nix``
+##     uses, read from that repository's committed ``flake.lock``: Go 1.24
+##     and fenix stable ``rustc`` with its matching ``wasm32-wasip1``
+##     standard library, plus the native C compiler and pinned zstd that
+##     cgo links through (``fixture_sdk_tools.nim``,
+##     ``tools/fixture-sdk/default.nix``). They are provisioned as declared
+##     packages, not taken from whatever ``go`` or ``rustc`` the host's
+##     ``PATH`` holds. The same compiler wrapper is handed to
+##     ``buildSharedLib`` through ``compilerSdkRefs``, so the writer library
+##     and the Go test link against one zstd.
+##   * **Relinking.** Go's build cache keys a cgo link on its flags, not on
+##     the bytes of the libraries they name: a rebuilt writer library in an
+##     unchanged directory would be served from a cached link. The edge
+##     therefore owns its Go build cache (``GOCACHE``) and the engine
+##     removes it before every run. The writer library is a declared input,
+##     so changing it reruns the edge, and every run compiles and links from
+##     an empty cache. ``-count=1`` (in the owning command) keeps Go from
+##     replaying a cached test result.
+##   * The builder writes its outputs atomically (process-private temporary
+##     file, then rename) and reuses them only when its compiler/source
+##     stamp matches. The whole output directory, stamp included, is
+##     declared, and nothing here bypasses or pre-creates it.
+##
+## **Node.** ``codetracer-wasm-instrumenter/tests/exception_handling.rs``
+## runs every exceptions-proposal module under the host V8 through
+## ``node`` (``codetracer-wasm-stub-host/src/v8.rs``), because ``wasmi``
+## 0.31 cannot enable that proposal. ``node`` is therefore a declared tool
+## of the cargo test-run edge (and of the plugin and runtime edges), so
+## its identity is part of the edge's identity. Without ``node`` the suite
+## fails, deliberately: there is no skip arm.
+##
+## **Platforms.** Linux and macOS run the whole inventory. On Windows the
+## cargo build and the plugin/runtime suites are unchanged, but the
+## golden-fixture edge cannot run yet: Windows has no Nix, so the SDK above
+## has no realization there, and the Windows Go/cgo toolchain (Go, a MinGW
+## gcc for cgo, a MinGW-linkable zstd, and the writer as a DLL the MinGW
+## linker can consume) has no supported provisioning in reprobuild today.
+## The Windows ``test`` collection therefore holds an edge that fails with
+## a message naming exactly that, instead of guessing at a toolchain or
+## dropping the edge; see ``windowsFixtureCapabilityUnavailable`` below.
+##
+## **Tool provisioning.** ``defaultToolProvisioning "path"`` for the cargo
+## toolchain: the dev shell (``flake.nix``) puts ``cargo`` / ``rustc`` /
+## ``node`` on ``PATH``. The fixture SDK packages are not on any ``PATH``,
+## so path mode realizes them from their Nix expression.
 
+import std/[json, os]
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
+import fixture_sdk_tools
+import "../codetracer-trace-format-nim/build_writer_artifacts"
+
+const
+  recorderRoot = "../codetracer-wasm-recorder"
+    ## The WASM recorder checkout, relative to this repository's root. The
+    ## golden-fixture edge runs in it and writes its fixture directory.
+  nimRoot = "../codetracer-trace-format-nim"
+    ## The trace-format-nim checkout that owns the C ABI writer library.
+  fixtureScratch = ".repro/build/golden-fixtures"
+    ## Scratch tree the golden-fixture edge owns (Go caches, TMPDIR).
+  goldenFixtureDir = recorderRoot / "cmd/wazero/testdata/recorder-golden/build"
+    ## The owning builder's output directory (``goldenFixtureOutDir`` in
+    ## ``cmd/wazero/recorder_golden_fixtures_test.go``).
+  goldenFixtureNames = ["collections", "column_aware", "control_flow",
+                        "nested_calls", "panic_path"]
+    ## ``goldenFixtureNames`` in the same file. The builder itself fails if
+    ## this list and the ``.rs`` sources disagree; the copy here only names
+    ## the declared outputs.
+  windowsFixtureCapabilityUnavailable =
+    "codetracer-wasm-instrumenter: the WASM golden-fixture prerequisite " &
+    "(`go test ./cmd/wazero -run \"^TestRecorderGoldenFixturesBuild$\" " &
+    "-count=1` in codetracer-wasm-recorder, with CGO_ENABLED=1) cannot run " &
+    "on Windows: capability unavailable. It needs, provisioned and cached " &
+    "by reprobuild rather than taken from the runner's PATH: (1) Go 1.24 " &
+    "(the WASM recorder's flake pins go_1_24); (2) a MinGW-w64 gcc for cgo; " &
+    "(3) zstd headers and a MinGW-linkable libzstd; (4) the " &
+    "codetracer-trace-format-nim C ABI writer built as a library the MinGW " &
+    "linker can link (its Windows buildSharedLib edge builds an MSVC DLL); " &
+    "(5) fenix stable rustc with the wasm32-wasip1 standard library. " &
+    "Reprobuild has no supported per-tool provisioning for this toolchain " &
+    "on Windows yet, so this edge fails instead of guessing one.\n"
+    ## Printed by the Windows stand-in for the golden-fixture edge.
 
 package codetracer_wasm_instrumenter:
   defaultToolProvisioning "path"
 
   uses:
-    # Rust toolchain — declared by version so the tarball-direct
+    # Rust toolchain -- declared by version so the tarball-direct
     # provisioning entries in repro_dsl_stdlib/packages/cargo.nim /
     # rustc.nim resolve on Windows; on Linux/macOS the dev shell supplies
     # the same versions. The root ``Cargo.toml`` pins ``edition = "2021"``
-    # and pins no ``rust-version`` floor, so the floor mirrors the sibling
-    # Rust-recorder recipes (``>=1.83``), comfortably below the toolchain
-    # that resolves the crates.io deps (walrus 0.26 / wasmparser 0.245).
+    # and no ``rust-version`` floor, so the floor mirrors the sibling
+    # Rust-recorder recipes (``>=1.83``).
     "rustc >=1.83"
     "cargo >=1.83"
     # C compiler driver -- rustc links every binary (the ``ct-instrument``
-    # CLI and each test executable) through ``cc`` on Linux/macOS. Declaring
-    # it puts the driver on the cargo edges' PATH instead of leaving it to
-    # whatever the ambient shell carries. Windows links with MSVC instead.
+    # CLI and each test executable) through ``cc`` on Linux/macOS, and
+    # ``buildSharedLib`` names the same backend on its edge (it refuses a
+    # consumer that does not declare
+    # ``build_writer_artifacts.SharedLibToolSelectors``). Windows links the
+    # cargo outputs with MSVC instead.
     when defined(linux):
       "gcc"
     elif defined(macosx):
       "clang"
-    # Node.js -- ``tests/exception_handling.rs`` runs every exceptions-
-    # proposal module under the host V8 through ``node``
-    # (``codetracer-wasm-stub-host/src/v8.rs``), because ``wasmi`` cannot
-    # enable that proposal. The flake's dev shell carries ``nodejs_22``.
+    # Node.js -- the V8 oracle of ``tests/exception_handling.rs`` and the
+    # ``node --test`` plugin/runtime suites. The flake's dev shell carries
+    # ``nodejs_22``.
     "node >=22"
+    when not defined(windows):
+      # The owning WASM recorder's pinned compiler SDK
+      # (``fixture_sdk_tools.nim``) for the golden-fixture Go test, and the
+      # Nim compiler that ``buildSharedLib`` drives.
+      "fixture-go-sdk"
+      "fixture-rustc-sdk"
+      "fixture-cc-sdk"
+      "nim >=2.2 <3.0"
 
-  # The shipping binary — the ``ct-instrument`` bin target of the
+  # The shipping binary -- the ``ct-instrument`` bin target of the
   # ``ct-instrument-cli`` workspace member. The per-app cargo build edge
   # is emitted in the ``build:`` block below.
   executable ctInstrument:
@@ -129,26 +205,26 @@ package codetracer_wasm_instrumenter:
     activity "default"
 
   build:
+    let root = activeProviderProjectRoot()
+
+    proc rooted(paths: openArray[string]): seq[string] =
+      ## The engine resolves an action's relative input, output and scratch
+      ## paths against the action's working directory. The edges below run
+      ## in another directory (the WASM recorder checkout, a plugin
+      ## directory), so their paths are anchored to this repository's root
+      ## explicitly; written relative, they would land inside the directory
+      ## the command runs in.
+      for path in paths:
+        result.add(normalizedPath(root / path))
+
     # ---- Primary build edge (the `default` collection) ----------------
     #
-    # Native whole-workspace cargo build. The root ``Cargo.toml`` is a
-    # real workspace with four members; bare ``cargo build`` builds every
-    # member including the ``ct-instrument`` binary. Enrolled into the
-    # conventional ``default`` collection per
-    # reprobuild-specs/Build-Graph-Collections.md §"`default`" so
-    # ``repro build`` (no positional target) materialises this edge's
-    # closure.
-    #
-    # ``locked = true`` because the root ``Cargo.lock`` IS committed
-    # (``git ls-files`` tracks it): the build must fail rather than
-    # silently regenerate the lock if a member's ``Cargo.toml`` drifts
-    # from the pinned resolution.
-    #
-    # The workspace tree (root manifest/lock + the ``crates`` dir) is
-    # declared as ``extraInputs`` so the engine tracks the whole workspace
-    # as the build edge's input set (cargo's own ``.d`` depfiles under
-    # ``target/*/deps`` refine this per-crate at action-end via the
-    # makeDepfile dependency policy the cargo package declares).
+    # Native whole-workspace cargo build: bare ``cargo build`` builds every
+    # member, including the ``ct-instrument`` binary. ``locked = true``
+    # because the root ``Cargo.lock`` is committed: the build must fail
+    # rather than silently regenerate the lock if a member's ``Cargo.toml``
+    # drifts from the pinned resolution. The workspace tree is declared as
+    # ``extraInputs``; cargo's own ``.d`` depfiles refine it per crate.
     const binarySuffix = (when defined(windows): ".exe" else: "")
     const cliBinary = "target/release/ct-instrument" & binarySuffix
 
@@ -165,25 +241,109 @@ package codetracer_wasm_instrumenter:
       extraOutputs = @[cliBinary])
     discard collect("default", @[cliBuild])
 
+    # ---- Golden-fixture prerequisite (part of the `test` collection) --
+    #
+    # See the module doc, "The golden-fixture edge".
+    var fixtureOutputs = @[goldenFixtureDir / "stamp.txt"]
+    for name in goldenFixtureNames:
+      fixtureOutputs.add(goldenFixtureDir / (name & ".wasm"))
+
+    when defined(windows):
+      # No supported Windows provisioning exists for this edge's toolchain
+      # (module doc, "Platforms"). This stand-in keeps the edge, and the
+      # cargo run's dependency on it, in the Windows graph and makes it
+      # fail with the capability that is missing; it builds nothing.
+      let fixtureCall = publicCliCall("node", "node", "",
+        "codetracer-wasm-instrumenter.golden-fixtures.windows-unavailable", @[
+          cliArgSeq("args", @["-e",
+            "process.stderr.write(" & escapeJson(
+              windowsFixtureCapabilityUnavailable) & ");process.exit(1)"],
+            kind = cpkPositional)])
+      let goldenFixtures = buildAction(
+        "codetracer-wasm-instrumenter.golden-fixtures", fixtureCall,
+        toolIdentityRefs = @["node"], cacheable = false)
+    else:
+      # The owning trace-writer producer, compiled by the same SDK compiler
+      # wrapper the Go edge links with (its zstd include/link/rpath flags
+      # come from that wrapper; see tools/fixture-sdk/default.nix).
+      let writerLibrary = buildSharedLib(nimRoot,
+        compilerSdkRefs = @["fixture-cc-sdk"])
+      appendRegisteredActionToolIdentityRefs(writerLibrary.id, ["nim"])
+      let writerArtifact = sharedLibraryPath(nimRoot)
+      let writerDir = normalizedPath(root / nimRoot)
+      let writerIncludeDir = writerDir / "include"
+
+      let goEnv = @[
+        # The cgo package variant the dev shell builds and ships.
+        ("CGO_ENABLED", "1"),
+        # The SDK's C compiler wrapper, by the name it carries in the SDK.
+        ("CC", "cc"),
+        ("CGO_CFLAGS", "-I" & writerIncludeDir),
+        ("CGO_LDFLAGS", "-L" & writerDir & " -Wl,-rpath," & writerDir),
+        # Edge-owned Go state: a build cache the engine empties before every
+        # run (see the module doc, "Relinking"), a module cache and GOPATH
+        # under the same scratch tree (the module vendors its dependencies,
+        # so nothing is downloaded), and no user-level `go env` file.
+        ("GOCACHE", root / fixtureScratch / "go-build-cache"),
+        ("GOPATH", root / fixtureScratch / "gopath"),
+        ("GOMODCACHE", root / fixtureScratch / "gopath/pkg/mod"),
+        ("GOENV", "off"),
+        ("GOTOOLCHAIN", "local"),
+        ("GOPROXY", "off"),
+        ("TMPDIR", root / fixtureScratch / "tmp")]
+
+      let goCall = publicCliCall("fixture-go-sdk", "fixture-go-sdk", "",
+        "codetracer-wasm-instrumenter.golden-fixtures", @[
+          cliArgSeq("args", @["test", "./cmd/wazero",
+            "-run", "^TestRecorderGoldenFixturesBuild$", "-count=1"],
+            kind = cpkPositional)])
+      let goldenFixtures = buildAction(
+        "codetracer-wasm-instrumenter.golden-fixtures", goCall,
+        deps = @[writerLibrary.id],
+        inputs = rooted(@[
+          # The Go module: manifests, vendored dependencies, and every
+          # package `cmd/wazero` and its tests compile.
+          recorderRoot / "go.mod", recorderRoot / "go.sum",
+          recorderRoot / "vendor", recorderRoot / "*.go",
+          recorderRoot / "api", recorderRoot / "sys",
+          recorderRoot / "imports", recorderRoot / "experimental",
+          recorderRoot / "internal", recorderRoot / "tracewriter",
+          recorderRoot / "cmd/wazero/*.go",
+          recorderRoot / "cmd/wazero/testdata/*.wasm",
+          recorderRoot / "cmd/wazero/testdata/*.wat",
+          recorderRoot / "cmd/wazero/testdata/boundary-log",
+          recorderRoot / "cmd/wazero/testdata/cat",
+          recorderRoot / "cmd/wazero/testdata/fs",
+          recorderRoot / "cmd/wazero/testdata/stylus",
+          # The fixture sources.
+          recorderRoot / "cmd/wazero/testdata/recorder-golden/*.rs",
+          # The compiler configuration the SDK is read from.
+          recorderRoot / "flake.lock", recorderRoot / "shell.nix",
+          "tools/fixture-sdk/default.nix", "fixture_sdk_tools.nim",
+          # The writer library and the headers cgo compiles against.
+          writerArtifact, nimRoot / "include",
+          recorderRoot / "tracewriter/codetracer_trace_writer.h",
+          recorderRoot / "tracewriter/codetracer_trace_writer_columns.h"]),
+        # The Go build cache is an output the edge owns outright, so the
+        # engine may empty it before each run (module doc, "Relinking").
+        outputs = rooted(fixtureOutputs & @[fixtureScratch / "go-build-cache"]),
+        declaredOutputs = rooted(fixtureOutputs & @[fixtureScratch / "go-build-cache"]),
+        scratchDirs = rooted(@[fixtureScratch / "gopath", fixtureScratch / "tmp"]),
+        removeBeforeRun = rooted(@[fixtureScratch / "go-build-cache"]),
+        env = goEnv,
+        toolIdentityRefs = @["fixture-go-sdk", "fixture-rustc-sdk",
+          "fixture-cc-sdk"],
+        cwdKind = acwdCustom, cwdCustomPath = recorderRoot,
+        dependencyPolicy = automaticMonitorPolicy(), cacheable = false)
+
     # ---- Test-binary build + run edges (the `test` collection) -------
     #
-    # Two-stage shape per Repo-Requirements.md §2.8: ``cargo.test(noRun =
-    # true)`` builds every workspace test binary into
-    # ``target/debug/deps/<crate>-<hash>`` (the engine tracks the deps
-    # directory as the build edge's effect set because the hashed filename
-    # floats with input content); the second ``cargo.test`` (``noRun``
-    # defaulting to false) then runs the binaries in one cargo invocation
-    # — the same whole-workspace pass ``cargo test --locked`` performs.
-    # The execute edge depends on the build edge so the engine only
-    # re-runs tests when an input changed since the last successful
-    # execution.
-    #
-    # Per-test execute edges fall out automatically once the
-    # ct-test-runner cargo adapter lands per
-    # reprobuild-specs/Test-Edges-And-Parallel-Runner.milestones.org §M4 —
-    # the whole-binary edge becomes a fan-out point without changing this
-    # recipe.
-
+    # ``cargo.test(noRun = true)`` builds every workspace test binary into
+    # ``target/debug/deps/<crate>-<hash>``; the second ``cargo.test`` runs
+    # them in one cargo invocation -- the same whole-workspace pass
+    # ``cargo test --workspace --locked`` performs. The run edge also
+    # follows the golden-fixture edge and declares the fixture files it
+    # reads, so a rebuilt fixture reruns the suite.
     let testsBuild = cargo.test(
       noRun = true,
       locked = true,
@@ -192,19 +352,21 @@ package codetracer_wasm_instrumenter:
       extraInputs = workspaceInputs,
       extraOutputs = @["target/debug/deps"])
 
+    let crossRepoTestInputs = @[
+      "../codetracer-evm-recorder/stylus/codetracer.toml",
+      recorderRoot / "internal/stylus/stylus_funcs.go"]
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-wasm-instrumenter.cargo-test-run",
-      after = @[testsBuild.action],
-      extraInputs = workspaceInputs & @["target/debug/deps"])
+      after = @[testsBuild.action, goldenFixtures],
+      extraInputs = workspaceInputs & @["target/debug/deps"] &
+        fixtureOutputs & crossRepoTestInputs)
 
     # Tool identities the cargo edges execute. Reprobuild's stdlib attaches
     # only a typed tool's own sub-tools, so every other program an action
     # runs must be attached here (and declared in ``uses:`` above): the
     # Rust toolchain itself, the C linker driver rustc invokes, and -- for
-    # the test-run edge only -- the ``node`` the V8 oracle spawns. Without
-    # these refs the action fingerprint ignores those tools and, outside
-    # PATH mode, the action cannot find them at all.
+    # the test-run edge only -- the ``node`` the V8 oracle spawns.
     const linkerRefs = (when defined(linux): @["gcc"]
                         elif defined(macosx): @["clang"]
                         else: newSeq[string]())
@@ -214,3 +376,79 @@ package codetracer_wasm_instrumenter:
     appendRegisteredActionToolIdentityRefs(testsRun.action.id, ["node"])
 
     discard collect("test", @[testsRun.action])
+
+    # ---- Node suites (the `test-plugins` / `test-runtime` collections) -
+    #
+    # ``just test-plugins`` runs ``node --test index.test.js`` inside each
+    # ``plugins/*/`` directory; ``just test-runtime`` runs the three
+    # ``recorder-runtime`` suites. Each edge runs the identical command in
+    # the identical directory. ``os.tmpdir()`` (where the wrappers stage
+    # their rewritten modules) is pointed at an edge-owned scratch tree.
+    #
+    # The vite and webpack suites resolve the CLI they drive by running
+    # ``cargo build --bin ct-instrument`` against this workspace
+    # (``CT_INSTRUMENT_BIN`` is unset under ``just`` too), so their edges also
+    # run cargo and the linker. If that build fails the suites print
+    # ``[skip]`` and pass, so the tools must be declared for the suites to
+    # test anything. Both write the same ``target/debug/ct-instrument``: the
+    # vite edge owns it as its output, and the webpack edge follows it and
+    # reads it, so the two cargo builds never run at once and only one edge
+    # claims the file.
+    const pluginNames = ["esbuild-plugin-codetracer-wasm",
+                         "rollup-plugin-codetracer-wasm",
+                         "vite-plugin-codetracer-wasm",
+                         "webpack-plugin-codetracer-wasm"]
+    const cargoDrivingPlugins = ["vite-plugin-codetracer-wasm",
+                                 "webpack-plugin-codetracer-wasm"]
+    const debugCli = "target/debug/ct-instrument" & binarySuffix
+    var pluginTests: seq[BuildActionDef] = @[]
+    var debugCliOwner = ""
+    for plugin in pluginNames:
+      let pluginDir = "plugins" / plugin
+      let scratch = ".repro/build/node-tests" / plugin
+      let call = publicCliCall("node", "node", "",
+        "codetracer-wasm-instrumenter.test-plugins." & plugin, @[
+          cliArgSeq("args", @["--test", "index.test.js"],
+            kind = cpkPositional)])
+      let drivesCargo = plugin in cargoDrivingPlugins
+      let ownsDebugCli = drivesCargo and debugCliOwner.len == 0
+      var inputs = @[pluginDir / "index.js", pluginDir / "index.test.js",
+                     pluginDir / "package.json"]
+      var deps: seq[string] = @[]
+      if drivesCargo:
+        inputs.add(workspaceInputs)
+        if not ownsDebugCli:
+          inputs.add(debugCli)
+          deps.add(debugCliOwner)
+      let outputs = (if ownsDebugCli: @[debugCli] else: newSeq[string]())
+      let action = buildAction(
+        "codetracer-wasm-instrumenter.test-plugins." & plugin, call,
+        deps = deps,
+        inputs = rooted(inputs),
+        outputs = rooted(outputs), declaredOutputs = rooted(outputs),
+        scratchDirs = rooted(@[scratch]),
+        env = @[("TMPDIR", root / scratch)],
+        toolIdentityRefs = @["node"] &
+          (if drivesCargo: @["cargo", "rustc"] & linkerRefs else: @[]),
+        cwdKind = acwdCustom, cwdCustomPath = pluginDir,
+        dependencyPolicy = automaticMonitorPolicy(), cacheable = false)
+      if ownsDebugCli:
+        debugCliOwner = action.id
+      pluginTests.add(action)
+    discard collect("test-plugins", pluginTests)
+
+    let runtimeScratch = ".repro/build/node-tests/recorder-runtime"
+    let runtimeCall = publicCliCall("node", "node", "",
+      "codetracer-wasm-instrumenter.test-runtime", @[
+        cliArgSeq("args", @["--test", "host_runtime.test.js",
+          "browser_session.test.js", "host_state.test.js"],
+          kind = cpkPositional)])
+    let runtimeTests = buildAction(
+      "codetracer-wasm-instrumenter.test-runtime", runtimeCall,
+      inputs = rooted(@["recorder-runtime/*.js"]),
+      scratchDirs = rooted(@[runtimeScratch]),
+      env = @[("TMPDIR", root / runtimeScratch)],
+      toolIdentityRefs = @["node"],
+      cwdKind = acwdCustom, cwdCustomPath = "recorder-runtime",
+      dependencyPolicy = automaticMonitorPolicy(), cacheable = false)
+    discard collect("test-runtime", @[runtimeTests])
